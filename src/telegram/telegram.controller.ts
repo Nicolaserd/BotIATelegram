@@ -8,6 +8,7 @@ import {
   Post,
   UseGuards,
 } from '@nestjs/common';
+import { waitUntil } from '@vercel/functions';
 import { Roles } from '../decorators/roles.decorator';
 import { Role } from '../enum/RoleUser.enum';
 import { AuthGuard } from '../guards/auth.guard';
@@ -48,11 +49,13 @@ export class TelegramController {
   ) {
     this.telegramService.verifyWebhookSecret(secretToken);
 
-    void this.telegramService.handleUpdate(update).catch((error) => {
+    const work = this.telegramService.handleUpdate(update).catch((error) => {
       this.logger.error(
         `Telegram update processing failed: ${error instanceof Error ? error.message : String(error)}`,
       );
     });
+
+    waitUntil(work);
 
     return { ok: true };
   }
