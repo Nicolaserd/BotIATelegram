@@ -53,8 +53,8 @@ export class IaService {
   private readonly geminiApiBase =
     'https://generativelanguage.googleapis.com/v1beta';
   private readonly nvidiaApiBase = 'https://integrate.api.nvidia.com/v1';
-  private readonly geminiTimeoutMs = 45_000;
-  private readonly nvidiaTimeoutMs = 50_000;
+  private readonly geminiTimeoutMs = 22_000;
+  private readonly nvidiaTimeoutMs = 25_000;
   private readonly knowledgeDirName = 'Docuentos_guia';
   private knowledgeBaseCache: string | null = null;
   private readonly marioSystemPrompt = [
@@ -283,7 +283,6 @@ export class IaService {
               ],
             },
             contents: this.buildContents(userMessage, context),
-            tools: [{ googleSearch: {} }],
             generationConfig: {
               temperature: 0.85,
               maxOutputTokens: 350,

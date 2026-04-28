@@ -31,7 +31,8 @@ type TelegramUpdate = {
 @Injectable()
 export class TelegramService {
   private readonly apiBase = 'https://api.telegram.org';
-  private readonly processingChats = new Set<string>();
+  private readonly processingChats = new Map<string, NodeJS.Timeout>();
+  private readonly processingMaxMs = 55_000;
   private readonly conversationLimit = 4;
   private readonly conversationLimitWindowHours = 24;
   private readonly contextConversationLimit = 10;
@@ -113,7 +114,13 @@ export class TelegramService {
       };
     }
 
-    this.processingChats.add(chatKey);
+    const releaseTimer = setTimeout(() => {
+      this.processingChats.delete(chatKey);
+    }, this.processingMaxMs);
+    if (typeof releaseTimer.unref === 'function') {
+      releaseTimer.unref();
+    }
+    this.processingChats.set(chatKey, releaseTimer);
 
     try {
       const windowCount = await this.countConversationsInCurrentWindow();
@@ -225,6 +232,10 @@ export class TelegramService {
         chatId,
       };
     } finally {
+      const timer = this.processingChats.get(chatKey);
+      if (timer) {
+        clearTimeout(timer);
+      }
       this.processingChats.delete(chatKey);
     }
   }
