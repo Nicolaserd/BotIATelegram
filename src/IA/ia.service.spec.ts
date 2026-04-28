@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { IaService } from './ia.service';
+import { AllAiProvidersExhaustedError, IaService } from './ia.service';
 
 type FetchMock = jest.Mock<Promise<Response>, Parameters<typeof fetch>>;
 
@@ -265,18 +265,16 @@ describe('IaService - Mario bot mock', () => {
       });
     });
 
-    it('lanza error si NVIDIA responde con status no-OK', async () => {
+    it('lanza AllAiProvidersExhaustedError si NVIDIA responde con status no-OK y no hay Gemini', async () => {
       fetchMock.mockResolvedValueOnce({
         ok: false,
         status: 503,
         json: async () => ({ error: { message: 'service unavailable' } }),
       } as unknown as Response);
 
-      await expect(service.generateReply('hola')).rejects.toMatchObject({
-        response: expect.objectContaining({
-          message: 'NVIDIA AI request failed.',
-        }),
-      });
+      await expect(service.generateReply('hola')).rejects.toBeInstanceOf(
+        AllAiProvidersExhaustedError,
+      );
     });
 
     it('devuelve fallback amable cuando NVIDIA responde sin contenido', async () => {
@@ -327,6 +325,91 @@ describe('IaService - Mario bot mock', () => {
       }
       // eslint-disable-next-line no-console
       console.log('\n====================================================\n');
+    });
+  });
+
+  // -------------------- Cadena de fallback completa --------------------
+  describe('cadena de fallback Gemini → NVIDIA → error', () => {
+    it('cae a NVIDIA cuando Gemini agota cuota (429)', async () => {
+      process.env.GOOGLE_AI_API_KEY = 'fake-gemini-key';
+      process.env.NVIDIA_API_KEY = 'fake-nvidia-key';
+
+      fetchMock
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 429,
+          json: async () => ({
+            error: { message: 'RESOURCE_EXHAUSTED: quota exceeded' },
+          }),
+        } as unknown as Response)
+        .mockResolvedValueOnce(
+          buildNvidiaResponse(
+            'Respondo desde NVIDIA porque Gemini agoto cuota [CARACTERIZACIÓN GOBIERNO DE DATOS.md]',
+          ),
+        );
+
+      const reply = await service.generateReply('test');
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(String(fetchMock.mock.calls[0][0])).toContain(
+        'generativelanguage.googleapis.com',
+      );
+      expect(String(fetchMock.mock.calls[1][0])).toContain(
+        'integrate.api.nvidia.com',
+      );
+      expect(reply).toContain('NVIDIA');
+    });
+
+    it('lanza AllAiProvidersExhaustedError cuando AMBOS fallan, conservando los detalles', async () => {
+      process.env.GOOGLE_AI_API_KEY = 'fake-gemini-key';
+      process.env.NVIDIA_API_KEY = 'fake-nvidia-key';
+
+      fetchMock
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 429,
+          json: async () => ({
+            error: { message: 'RESOURCE_EXHAUSTED: quota exceeded' },
+          }),
+        } as unknown as Response)
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 503,
+          json: async () => ({
+            error: { message: 'service unavailable' },
+          }),
+        } as unknown as Response);
+
+      let caught: unknown;
+      try {
+        await service.generateReply('test');
+      } catch (e) {
+        caught = e;
+      }
+
+      expect(caught).toBeInstanceOf(AllAiProvidersExhaustedError);
+      const err = caught as AllAiProvidersExhaustedError;
+      expect(err.geminiError).toMatch(/Google AI request failed|RESOURCE_EXHAUSTED/);
+      expect(err.nvidiaError).toMatch(/NVIDIA AI request failed|service unavailable/);
+    });
+
+    it('lanza AllAiProvidersExhaustedError con detalles de "no configurada" si faltan ambas claves', async () => {
+      delete process.env.GOOGLE_AI_API_KEY;
+      delete process.env.GEMINI_API_KEY;
+      delete process.env.NVIDIA_API_KEY;
+
+      let caught: unknown;
+      try {
+        await service.generateReply('hola');
+      } catch (e) {
+        caught = e;
+      }
+
+      expect(caught).toBeInstanceOf(AllAiProvidersExhaustedError);
+      const err = caught as AllAiProvidersExhaustedError;
+      expect(err.geminiError).toContain('no configurada');
+      expect(err.nvidiaError).toContain('no configurada');
+      expect(fetchMock).not.toHaveBeenCalled();
     });
   });
 });

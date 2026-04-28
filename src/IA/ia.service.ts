@@ -37,6 +37,16 @@ export type AiConversationContext = {
   botMessage: string;
 };
 
+export class AllAiProvidersExhaustedError extends Error {
+  constructor(
+    public readonly geminiError: string | null,
+    public readonly nvidiaError: string | null,
+  ) {
+    super('All AI providers failed or are unavailable.');
+    this.name = 'AllAiProvidersExhaustedError';
+  }
+}
+
 @Injectable()
 export class IaService {
   private readonly logger = new Logger(IaService.name);
@@ -151,23 +161,39 @@ export class IaService {
     context: AiConversationContext[] = [],
   ) {
     const hasGeminiKey =
-      process.env.GOOGLE_AI_API_KEY || process.env.GEMINI_API_KEY;
+      !!(process.env.GOOGLE_AI_API_KEY || process.env.GEMINI_API_KEY);
     const hasNvidiaKey = !!process.env.NVIDIA_API_KEY;
+
+    let geminiError: string | null = null;
+    let nvidiaError: string | null = null;
 
     if (hasGeminiKey) {
       try {
         return await this.generateGeminiReply(userMessage, context);
       } catch (error) {
-        if (!hasNvidiaKey) {
-          throw error;
-        }
+        geminiError = this.describeError(error);
         this.logger.warn(
-          `Gemini fallo; usando fallback NVIDIA/DeepSeek. Motivo: ${this.describeError(error)}`,
+          `Gemini fallo. Motivo: ${geminiError}${hasNvidiaKey ? ' — intentando fallback NVIDIA/DeepSeek.' : ''}`,
         );
       }
+    } else {
+      geminiError = 'GOOGLE_AI_API_KEY/GEMINI_API_KEY no configurada.';
     }
 
-    return this.generateNvidiaReply(userMessage, context);
+    if (hasNvidiaKey) {
+      try {
+        return await this.generateNvidiaReply(userMessage, context);
+      } catch (error) {
+        nvidiaError = this.describeError(error);
+        this.logger.error(
+          `NVIDIA tambien fallo. Motivo: ${nvidiaError}`,
+        );
+      }
+    } else {
+      nvidiaError = 'NVIDIA_API_KEY no configurada.';
+    }
+
+    throw new AllAiProvidersExhaustedError(geminiError, nvidiaError);
   }
 
   private async generateNvidiaReply(

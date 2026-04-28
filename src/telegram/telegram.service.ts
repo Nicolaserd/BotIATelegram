@@ -6,7 +6,10 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Between, Repository } from 'typeorm';
-import { IaService } from '../IA/ia.service';
+import {
+  AllAiProvidersExhaustedError,
+  IaService,
+} from '../IA/ia.service';
 import { TelegramConversation } from '../entities/telegram-conversation.entity';
 import { ConversationEncryptionService } from './conversation-encryption.service';
 
@@ -204,10 +207,17 @@ export class TelegramService {
       };
     } catch (error) {
       console.error('AI response failed:', error);
-      await this.sendMessage(
-        chatId,
-        'Tuve un problema pensando la respuesta. Intenta otra vez en un momento.',
-      );
+
+      const userMessage =
+        error instanceof AllAiProvidersExhaustedError
+          ? this.buildProvidersExhaustedMessage(error)
+          : 'Tuve un problema pensando la respuesta. Intenta otra vez en un momento.';
+
+      try {
+        await this.sendMessage(chatId, userMessage);
+      } catch (sendError) {
+        console.error('Failed to notify user about AI failure:', sendError);
+      }
 
       return {
         ok: false,
@@ -217,6 +227,30 @@ export class TelegramService {
     } finally {
       this.processingChats.delete(chatKey);
     }
+  }
+
+  private buildProvidersExhaustedMessage(
+    error: AllAiProvidersExhaustedError,
+  ): string {
+    const lines = [
+      '⚠️ Las dos IAs estan caidas o sin cupo ahora mismo. No puedo responder en este momento.',
+      'Intenta de nuevo en unos minutos. Si el problema sigue, avisa al administrador.',
+    ];
+
+    if (error.geminiError) {
+      lines.push(`• Gemini: ${this.shortenForUser(error.geminiError)}`);
+    }
+    if (error.nvidiaError) {
+      lines.push(`• NVIDIA: ${this.shortenForUser(error.nvidiaError)}`);
+    }
+
+    return lines.join('\n');
+  }
+
+  private shortenForUser(detail: string): string {
+    const max = 140;
+    const cleaned = detail.replace(/\s+/g, ' ').trim();
+    return cleaned.length > max ? `${cleaned.slice(0, max - 1)}…` : cleaned;
   }
 
   private async sendChatAction(chatId: string | number, action: string) {
