@@ -177,4 +177,156 @@ describe('IaService - Mario bot mock', () => {
     expect(body.contents[1].role).toBe('model');
     expect(body.contents[2].parts[0].text).toBe('y entonces?');
   });
+
+  // -------------------- Solo NVIDIA --------------------
+  describe('proveedor NVIDIA exclusivo (sin Gemini)', () => {
+    beforeEach(() => {
+      delete process.env.GOOGLE_AI_API_KEY;
+      delete process.env.GEMINI_API_KEY;
+      process.env.NVIDIA_API_KEY = 'fake-nvidia-key';
+    });
+
+    it('llama directamente al endpoint de NVIDIA cuando no hay clave de Gemini', async () => {
+      fetchMock.mockResolvedValueOnce(
+        buildNvidiaResponse(
+          'Mario al habla ⚽. El gobierno de datos define roles y responsabilidades [CARACTERIZACIÓN GOBIERNO DE DATOS.md]',
+        ),
+      );
+
+      const reply = await service.generateReply('¿qué es gobierno de datos?');
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchMock.mock.calls[0];
+      expect(String(url)).toContain('integrate.api.nvidia.com');
+      expect(String(url)).toContain('/chat/completions');
+
+      const headers = (init as RequestInit).headers as Record<string, string>;
+      expect(headers.Authorization).toBe('Bearer fake-nvidia-key');
+      expect(headers['Content-Type']).toBe('application/json');
+
+      expect(reply).toContain('[CARACTERIZACIÓN GOBIERNO DE DATOS.md]');
+    });
+
+    it('arma messages con system + user y respeta el modelo configurado', async () => {
+      process.env.NVIDIA_MODEL = 'deepseek-ai/deepseek-v3.2';
+      fetchMock.mockResolvedValueOnce(
+        buildNvidiaResponse(
+          'Esto sale del manual [CARACTERIZACIÓN GOBIERNO DE DATOS.md]',
+        ),
+      );
+
+      await service.generateReply('test');
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1]!.body as string);
+      expect(body.model).toBe('deepseek-ai/deepseek-v3.2');
+      expect(body.stream).toBe(false);
+      expect(body.messages).toHaveLength(2);
+      expect(body.messages[0].role).toBe('system');
+      expect(body.messages[0].content).toContain(
+        'PROMPT MAESTRO - AGENTE "MARIO"',
+      );
+      expect(body.messages[0].content).toContain('REGLA INQUEBRANTABLE #1');
+      expect(body.messages[0].content).toContain(
+        'BASE DE CONOCIMIENTO INTERNA',
+      );
+      expect(body.messages[1].role).toBe('user');
+      expect(body.messages[1].content).toBe('test');
+    });
+
+    it('intercala contexto previo en formato user/assistant', async () => {
+      fetchMock.mockResolvedValueOnce(
+        buildNvidiaResponse(
+          'Continuando lo anterior [CARACTERIZACIÓN GOBIERNO DE DATOS.md]',
+        ),
+      );
+
+      await service.generateReply('¿y los responsables?', [
+        {
+          userMessage: 'qué es gobierno de datos',
+          botMessage:
+            'Es un conjunto de politicas [CARACTERIZACIÓN GOBIERNO DE DATOS.md]',
+        },
+      ]);
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1]!.body as string);
+      expect(body.messages).toHaveLength(4);
+      expect(body.messages[0].role).toBe('system');
+      expect(body.messages[1]).toEqual({
+        role: 'user',
+        content: 'qué es gobierno de datos',
+      });
+      expect(body.messages[2].role).toBe('assistant');
+      expect(body.messages[2].content).toContain(
+        '[CARACTERIZACIÓN GOBIERNO DE DATOS.md]',
+      );
+      expect(body.messages[3]).toEqual({
+        role: 'user',
+        content: '¿y los responsables?',
+      });
+    });
+
+    it('lanza error si NVIDIA responde con status no-OK', async () => {
+      fetchMock.mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+        json: async () => ({ error: { message: 'service unavailable' } }),
+      } as unknown as Response);
+
+      await expect(service.generateReply('hola')).rejects.toMatchObject({
+        response: expect.objectContaining({
+          message: 'NVIDIA AI request failed.',
+        }),
+      });
+    });
+
+    it('devuelve fallback amable cuando NVIDIA responde sin contenido', async () => {
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ choices: [{ message: { content: '   ' } }] }),
+      } as unknown as Response);
+
+      const reply = await service.generateReply('hola');
+      expect(reply).toBe('No pude generar una respuesta en este momento.');
+    });
+
+    it('imprime conversación NVIDIA con cita visible', async () => {
+      const turns = [
+        {
+          question: '¿Qué es el gobierno de datos?',
+          mockedReply:
+            'El gobierno de datos define roles, politicas y responsabilidades [CARACTERIZACIÓN GOBIERNO DE DATOS.md]',
+        },
+        {
+          question: 'dame pizza y dime quién responde por los datos críticos',
+          mockedReply:
+            '¿Pizza? 🦭🍕 ya, ya, me concentro 😅⚽. Todo dato critico debe tener un responsable definido [CARACTERIZACIÓN GOBIERNO DE DATOS.md]',
+        },
+      ];
+
+      // eslint-disable-next-line no-console
+      console.log('\n===== Mock NVIDIA-only conversación con Mario =====');
+      for (const { question, mockedReply } of turns) {
+        fetchMock.mockResolvedValueOnce(buildNvidiaResponse(mockedReply));
+        const result = await service.generateReply(question);
+
+        // eslint-disable-next-line no-console
+        console.log(`\n👤 Usuario: ${question}`);
+        // eslint-disable-next-line no-console
+        console.log(`🤖 Mario (via NVIDIA): ${result}`);
+
+        const citation = result.match(/\[([^\]]+\.md)\]/);
+        // eslint-disable-next-line no-console
+        console.log(`📎 Cita detectada: ${citation?.[0]}`);
+
+        expect(result).toBe(mockedReply);
+        expect(citation).not.toBeNull();
+        expect(String(fetchMock.mock.calls.at(-1)?.[0])).toContain(
+          'integrate.api.nvidia.com',
+        );
+      }
+      // eslint-disable-next-line no-console
+      console.log('\n====================================================\n');
+    });
+  });
 });
