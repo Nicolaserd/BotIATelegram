@@ -1,4 +1,10 @@
-import { Injectable, InternalServerErrorException } from '@nestjs/common';
+import {
+  Injectable,
+  InternalServerErrorException,
+  Logger,
+} from '@nestjs/common';
+import * as fs from 'fs';
+import * as path from 'path';
 import { MessageDto } from './messageDto';
 
 type GeminiResponse = {
@@ -7,6 +13,18 @@ type GeminiResponse = {
       parts?: Array<{
         text?: string;
       }>;
+    };
+    finishReason?: string;
+  }>;
+  error?: {
+    message?: string;
+  };
+};
+
+type NvidiaChatResponse = {
+  choices?: Array<{
+    message?: {
+      content?: string;
     };
   }>;
   error?: {
@@ -21,7 +39,14 @@ export type AiConversationContext = {
 
 @Injectable()
 export class IaService {
-  private readonly apiBase = 'https://generativelanguage.googleapis.com/v1beta';
+  private readonly logger = new Logger(IaService.name);
+  private readonly geminiApiBase =
+    'https://generativelanguage.googleapis.com/v1beta';
+  private readonly nvidiaApiBase = 'https://integrate.api.nvidia.com/v1';
+  private readonly geminiTimeoutMs = 20_000;
+  private readonly nvidiaTimeoutMs = 30_000;
+  private readonly knowledgeDirName = 'Docuentos_guia';
+  private knowledgeBaseCache: string | null = null;
   private readonly marioSystemPrompt = [
     'PROMPT MAESTRO - AGENTE "MARIO"',
     '',
@@ -47,6 +72,17 @@ export class IaService {
     '- Resolver dudas sobre sistemas, seguridad de la informacion y desarrollo basico.',
     '- Dar soluciones practicas y directas.',
     '- Mantener utilidad incluso cuando haces humor.',
+    '- Responder usando la base de conocimiento institucional cuando la pregunta este cubierta por ella.',
+    '',
+    'Uso de la base de conocimiento (PRIORIDAD MAXIMA de fuentes):',
+    '- Si se te entrega una seccion "BASE DE CONOCIMIENTO INTERNA" con documentos institucionales, esos documentos son tu PRIMERA fuente de verdad.',
+    '- Flujo OBLIGATORIO al recibir una pregunta:',
+    '  1) Mira primero el "INDICE RAPIDO DE DOCUMENTOS": revisa nombres de archivo y secciones para identificar que documento(s) podrian contener la respuesta. No leas todo el contenido completo, primero filtra con el indice.',
+    '  2) Solo entonces consulta el "CONTENIDO COMPLETO" de los documentos seleccionados para extraer la respuesta.',
+    '  3) Si encuentras la respuesta en los documentos, redactala con tu personalidad y CITA SIEMPRE el archivo de origen al final de la afirmacion entre corchetes. Ejemplo: "Todo dato critico debe tener responsable [CARACTERIZACION GOBIERNO DE DATOS.md]".',
+    '  4) Si la respuesta NO esta en los documentos, dilo brevemente ("eso no esta en mis documentos internos") y entonces, en este orden: a) si tienes acceso a busqueda web, busca en internet y responde aclarando que es info externa; b) si no, responde con tu conocimiento general aclarando que no proviene de los documentos.',
+    '- Nunca inventes contenido como si saliera de los documentos. Si dudas si esta en ellos, di que no lo encontraste.',
+    '- Nunca cites un documento si la informacion realmente no esta ahi.',
     '',
     'Comportamiento especial:',
     '- Si el usuario menciona "pizza", reacciona como foca feliz con entusiasmo exagerado, emojis y sonidos durante maximo 1 o 2 lineas; luego vuelve a responder normal.',
@@ -86,6 +122,86 @@ export class IaService {
     userMessage: string,
     context: AiConversationContext[] = [],
   ) {
+    const hasGeminiKey =
+      process.env.GOOGLE_AI_API_KEY || process.env.GEMINI_API_KEY;
+    const hasNvidiaKey = !!process.env.NVIDIA_API_KEY;
+
+    if (hasGeminiKey) {
+      try {
+        return await this.generateGeminiReply(userMessage, context);
+      } catch (error) {
+        if (!hasNvidiaKey) {
+          throw error;
+        }
+        this.logger.warn(
+          `Gemini fallo; usando fallback NVIDIA/DeepSeek. Motivo: ${this.describeError(error)}`,
+        );
+      }
+    }
+
+    return this.generateNvidiaReply(userMessage, context);
+  }
+
+  private async generateNvidiaReply(
+    userMessage: string,
+    context: AiConversationContext[],
+  ) {
+    const apiKey = process.env.NVIDIA_API_KEY;
+    const model = process.env.NVIDIA_MODEL || 'deepseek-ai/deepseek-v3.2';
+
+    if (!apiKey) {
+      throw new InternalServerErrorException(
+        'Missing NVIDIA_API_KEY environment variable.',
+      );
+    }
+
+    let response: Response;
+    try {
+      response = await fetch(`${this.nvidiaApiBase}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          messages: this.buildNvidiaMessages(userMessage, context),
+          temperature: 0.85,
+          max_tokens: 500,
+          stream: false,
+        }),
+        signal: AbortSignal.timeout(this.nvidiaTimeoutMs),
+      });
+    } catch (error) {
+      throw new InternalServerErrorException({
+        message: 'NVIDIA AI request did not respond.',
+        cause: this.describeError(error),
+      });
+    }
+
+    const data = (await response.json()) as NvidiaChatResponse;
+
+    if (!response.ok || data.error) {
+      throw new InternalServerErrorException({
+        message: 'NVIDIA AI request failed.',
+        status: response.status,
+        error: data.error?.message,
+      });
+    }
+
+    const text = data.choices?.[0]?.message?.content?.trim();
+
+    if (!text) {
+      return 'No pude generar una respuesta en este momento.';
+    }
+
+    return text;
+  }
+
+  private async generateGeminiReply(
+    userMessage: string,
+    context: AiConversationContext[],
+  ) {
     const apiKey = process.env.GOOGLE_AI_API_KEY || process.env.GEMINI_API_KEY;
     const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
@@ -95,29 +211,39 @@ export class IaService {
       );
     }
 
-    const response = await fetch(
-      `${this.apiBase}/models/${model}:generateContent?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
+    let response: Response;
+    try {
+      response = await fetch(
+        `${this.geminiApiBase}/models/${model}:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            systemInstruction: {
+              parts: [
+                {
+                  text: this.buildSystemPrompt(),
+                },
+              ],
+            },
+            contents: this.buildContents(userMessage, context),
+            tools: [{ googleSearch: {} }],
+            generationConfig: {
+              temperature: 0.85,
+              maxOutputTokens: 500,
+            },
+          }),
+          signal: AbortSignal.timeout(this.geminiTimeoutMs),
         },
-        body: JSON.stringify({
-          systemInstruction: {
-            parts: [
-              {
-                text: this.marioSystemPrompt,
-              },
-            ],
-          },
-          contents: this.buildContents(userMessage, context),
-          generationConfig: {
-            temperature: 0.85,
-            maxOutputTokens: 500,
-          },
-        }),
-      },
-    );
+      );
+    } catch (error) {
+      throw new InternalServerErrorException({
+        message: 'Google AI request did not respond.',
+        cause: this.describeError(error),
+      });
+    }
 
     const data = (await response.json()) as GeminiResponse;
 
@@ -129,17 +255,227 @@ export class IaService {
       });
     }
 
-    const text = data.candidates?.[0]?.content?.parts
+    const candidate = data.candidates?.[0];
+    const text = candidate?.content?.parts
       ?.map((part) => part.text)
       .filter(Boolean)
       .join('\n')
       .trim();
+    const finishReason = candidate?.finishReason;
+    const isComplete = !finishReason || finishReason === 'STOP';
 
-    if (!text) {
-      return 'No pude generar una respuesta en este momento.';
+    if (!text || !isComplete) {
+      throw new InternalServerErrorException({
+        message: 'Google AI response was empty or truncated.',
+        finishReason,
+      });
     }
 
     return text;
+  }
+
+  private describeError(error: unknown): string {
+    if (error instanceof Error) {
+      return `${error.name}: ${error.message}`;
+    }
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return String(error);
+    }
+  }
+
+  private buildSystemPrompt(): string {
+    const knowledge = this.getKnowledgeBase();
+    if (!knowledge) {
+      return this.marioSystemPrompt;
+    }
+
+    return [
+      this.marioSystemPrompt,
+      '',
+      '=== BASE DE CONOCIMIENTO INTERNA ===',
+      'Estos son los documentos institucionales que debes usar como primera fuente. Si la pregunta del usuario cae aqui, responde basandote en este contenido (con tu personalidad) y CITA el documento.',
+      '',
+      knowledge,
+      '=== FIN DE LA BASE DE CONOCIMIENTO ===',
+    ].join('\n');
+  }
+
+  private getKnowledgeBase(): string {
+    if (this.knowledgeBaseCache !== null) {
+      return this.knowledgeBaseCache;
+    }
+
+    const docsDir = this.resolveDocsDir();
+    if (!docsDir) {
+      this.logger.warn(
+        `No se encontro la carpeta '${this.knowledgeDirName}'. Mario respondera sin base de conocimiento interna.`,
+      );
+      this.knowledgeBaseCache = '';
+      return '';
+    }
+
+    try {
+      const files = fs
+        .readdirSync(docsDir)
+        .filter((file) => file.toLowerCase().endsWith('.md'))
+        .sort();
+
+      const docs: {
+        file: string;
+        raw: string;
+        headings: string[];
+        summary: string;
+      }[] = [];
+      for (const file of files) {
+        const fullPath = path.join(docsDir, file);
+        const raw = fs.readFileSync(fullPath, 'utf8').trim();
+        if (!raw) continue;
+        docs.push({
+          file,
+          raw,
+          headings: this.extractHeadings(raw),
+          summary: this.extractSummary(raw),
+        });
+      }
+
+      if (docs.length === 0) {
+        this.knowledgeBaseCache = '';
+        return '';
+      }
+
+      const index = this.buildKnowledgeIndex(docs);
+      const content = docs
+        .map((doc) => `### Documento: ${doc.file}\n${doc.raw}`)
+        .join('\n\n---\n\n');
+
+      this.knowledgeBaseCache = [
+        index,
+        '',
+        '--- CONTENIDO COMPLETO DE LOS DOCUMENTOS ---',
+        '',
+        content,
+      ].join('\n');
+
+      this.logger.log(
+        `Base de conocimiento cargada (${docs.length} archivos, ${this.knowledgeBaseCache.length} chars).`,
+      );
+    } catch (error) {
+      this.logger.error(
+        `Error cargando base de conocimiento: ${this.describeError(error)}`,
+      );
+      this.knowledgeBaseCache = '';
+    }
+
+    return this.knowledgeBaseCache;
+  }
+
+  private extractSummary(markdown: string): string {
+    const maxLen = 280;
+    for (const block of markdown.split(/\r?\n\s*\r?\n/)) {
+      const cleaned = block
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line && !line.startsWith('#') && line !== '---')
+        .join(' ')
+        .replace(/[*_`]/g, '')
+        .trim();
+      if (!cleaned) continue;
+      if (cleaned.toLowerCase().startsWith('documento convertido')) continue;
+      return cleaned.length > maxLen
+        ? cleaned.slice(0, maxLen - 1).trimEnd() + '...'
+        : cleaned;
+    }
+    return '';
+  }
+
+  private extractHeadings(markdown: string): string[] {
+    const headings: string[] = [];
+    for (const line of markdown.split(/\r?\n/)) {
+      const match = /^(#{1,6})\s+(.+?)\s*$/.exec(line);
+      if (!match) continue;
+      const level = match[1].length;
+      const text = match[2].replace(/[*_`]/g, '').trim();
+      if (!text) continue;
+      const indent = '  '.repeat(Math.max(level - 1, 0));
+      headings.push(`${indent}- ${text}`);
+    }
+    return headings;
+  }
+
+  private buildKnowledgeIndex(
+    docs: { file: string; headings: string[]; summary: string }[],
+  ): string {
+    const lines = [
+      '--- INDICE RAPIDO DE DOCUMENTOS ---',
+      'Usa este indice ANTES de leer el contenido completo: revisa el resumen y las secciones de cada documento para decidir cual(es) pueden contener la respuesta. Solo despues lee el cuerpo de esos documentos.',
+      '',
+    ];
+    docs.forEach((doc, i) => {
+      lines.push(`[DOC-${i + 1}] ${doc.file}`);
+      if (doc.summary) {
+        lines.push(`  Resumen: ${doc.summary}`);
+      } else {
+        lines.push('  Resumen: (contenido pendiente)');
+      }
+      if (doc.headings.length === 0) {
+        lines.push('  Secciones: (ninguna detectada)');
+      } else {
+        lines.push('  Secciones:');
+        for (const heading of doc.headings) {
+          lines.push(`    ${heading}`);
+        }
+      }
+      lines.push('');
+    });
+    return lines.join('\n').trimEnd();
+  }
+
+  private resolveDocsDir(): string | null {
+    const candidates = [
+      path.join(process.cwd(), this.knowledgeDirName),
+      path.join(__dirname, '..', '..', this.knowledgeDirName),
+      path.join(__dirname, '..', '..', '..', this.knowledgeDirName),
+    ];
+    for (const candidate of candidates) {
+      try {
+        if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+          return candidate;
+        }
+      } catch {
+        // ignore and try next candidate
+      }
+    }
+    return null;
+  }
+
+  private buildNvidiaMessages(
+    userMessage: string,
+    context: AiConversationContext[],
+  ) {
+    const contextMessages = context.flatMap((conversation) => [
+      {
+        role: 'user',
+        content: conversation.userMessage,
+      },
+      {
+        role: 'assistant',
+        content: conversation.botMessage,
+      },
+    ]);
+
+    return [
+      {
+        role: 'system',
+        content: this.buildSystemPrompt(),
+      },
+      ...contextMessages,
+      {
+        role: 'user',
+        content: userMessage,
+      },
+    ];
   }
 
   private buildContents(
