@@ -22,7 +22,7 @@ src/
   Auth/              Registro, login y JWT
   Users/             Usuarios y carga inicial de datos
   telegram/          Webhook y envio de mensajes por Telegram
-  IA/                Servicio de IA
+  IA/                Servicio de IA (Gemini con fallback a NVIDIA)
   npl/               Procesamiento de texto
   mercado-pago/      Integracion inicial de pagos
   entities/          Entidades de TypeORM
@@ -32,6 +32,9 @@ src/
   config/            Configuracion de TypeORM
 api/
   index.ts           Entrada serverless para Vercel
+Docuentos_guia/      Base de conocimiento institucional (.md) que el bot
+                     consulta y CITA al responder. Solo se incluyen documentos
+                     con contenido real; los archivos vacios deben omitirse.
 ```
 
 ## Variables de entorno
@@ -49,6 +52,8 @@ TELEGRAM_WEBHOOK_SECRET=
 GOOGLE_AI_API_KEY=
 GEMINI_API_KEY=
 GEMINI_MODEL=
+NVIDIA_API_KEY=
+NVIDIA_MODEL=
 BOT_UNLOCK_PIN=
 CONVERSATION_ENCRYPTION_KEY=
 ```
@@ -57,7 +62,8 @@ Notas:
 
 - `DATABASE_URL` se usa para una conexion completa a PostgreSQL.
 - Si no existe `DATABASE_URL`, la app intenta usar `DB_USER`, `POSTGRES_PASSWORD` y `POSTGRES_DB`.
-- `GOOGLE_AI_API_KEY` o `GEMINI_API_KEY` habilita las respuestas con IA.
+- `GOOGLE_AI_API_KEY` o `GEMINI_API_KEY` habilita las respuestas con IA (proveedor primario).
+- `NVIDIA_API_KEY` habilita el fallback automatico cuando Gemini falla. `NVIDIA_MODEL` es opcional.
 - `TELEGRAM_WEBHOOK_SECRET` es recomendado para validar llamadas entrantes de Telegram.
 - `CONVERSATION_ENCRYPTION_KEY` debe ser una clave larga y privada.
 - `BOT_UNLOCK_PIN` debe tratarse como secreto.
@@ -83,6 +89,23 @@ Flujo general:
 5. Enviar mensajes al bot desde Telegram.
 
 Usa siempre valores privados desde variables de entorno cuando registres el webhook.
+
+### Webhook asincronico
+
+El endpoint `POST /telegram/webhook` valida el header de secreto y responde
+`200 { ok: true }` de inmediato. La generacion de la respuesta de IA y el envio
+del mensaje al chat ocurren en segundo plano dentro de la misma funcion
+serverless. Esto evita que Telegram reintente el webhook por timeouts mientras
+el modelo esta pensando.
+
+Implicaciones:
+
+- La funcion debe permanecer viva el tiempo suficiente para terminar el trabajo
+  en background (ver `maxDuration` en la seccion de Deploy).
+- El cuerpo de la respuesta del webhook ya no expone metadatos como `attemptNumber`;
+  esos detalles se procesan internamente.
+- El throttle por chat (`processingChats`) sigue activo, pero es in-memory y por
+  instancia: para un candado fuerte entre invocaciones haria falta Redis o KV.
 
 ## Autenticacion
 
@@ -143,6 +166,14 @@ http://localhost:3000
 Este proyecto incluye `api/index.ts` y `vercel.json` para desplegar en Vercel.
 
 Antes de desplegar, configura las variables de entorno reales en Vercel. No las agregues al README ni a archivos versionados.
+
+Configuracion relevante de `vercel.json`:
+
+- `includeFiles: "Docuentos_guia/**"` empaqueta la base de conocimiento dentro
+  del bundle serverless para que `IaService` pueda leerla en runtime.
+- `maxDuration: 60` permite que la funcion siga viva hasta 60s mientras
+  termina el trabajo asincronico del webhook (Gemini + envio a Telegram).
+  Ajusta segun el plan de Vercel: Hobby admite hasta 60s, Pro mas.
 
 Preview:
 

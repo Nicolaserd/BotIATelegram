@@ -3,6 +3,8 @@ import {
   Controller,
   Get,
   Headers,
+  HttpCode,
+  Logger,
   Post,
   UseGuards,
 } from '@nestjs/common';
@@ -15,6 +17,8 @@ import { TelegramService } from './telegram.service';
 
 @Controller('telegram')
 export class TelegramController {
+  private readonly logger = new Logger(TelegramController.name);
+
   constructor(private readonly telegramService: TelegramService) {}
 
   @Get('status')
@@ -37,11 +41,19 @@ export class TelegramController {
   }
 
   @Post('webhook')
+  @HttpCode(200)
   handleWebhook(
     @Headers('x-telegram-bot-api-secret-token') secretToken: string,
     @Body() update: unknown,
   ) {
     this.telegramService.verifyWebhookSecret(secretToken);
-    return this.telegramService.handleUpdate(update);
+
+    void this.telegramService.handleUpdate(update).catch((error) => {
+      this.logger.error(
+        `Telegram update processing failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+
+    return { ok: true };
   }
 }

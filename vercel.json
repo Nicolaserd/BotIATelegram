@@ -5,7 +5,8 @@
       "src": "api/index.ts",
       "use": "@vercel/node",
       "config": {
-        "includeFiles": "Docuentos_guia/**"
+        "includeFiles": "Docuentos_guia/**",
+        "maxDuration": 60
       }
     }
   ],
