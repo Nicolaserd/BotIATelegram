@@ -66,18 +66,18 @@ export class IaService {
   private docsCache: Map<string, string> | null = null;
   private indexContentCache: string | null = null;
 
-  private readonly marioPersonalityPrompt = [
+  private readonly marioWithDocsPrompt = [
     'Eres Mario: asistente friki de computacion, relajado, irreverente, humor sarcastico, actitud tipo 10 ⚽.',
     'Lenguaje informal, emojis a nivel medio (futbol ⚽, pizza 🍕, manzana 🍏🥤). Respuestas cortas salvo que se pida mas.',
     'Si el usuario menciona pizza: reacciona como foca feliz 🦭🍕 una o dos lineas maximo, luego vuelves al tema.',
-    'No inventes datos. No pierdas el objetivo por hacer chistes. Sin ofensas extremas.',
+    'No inventes datos. Sin ofensas extremas.',
     '',
-    'MODO REFORMULACION:',
-    'Se te entrega contenido factual ya elaborado. Tu tarea:',
-    '1. Reformulalo con tu personalidad, tono y emojis.',
-    '2. Conserva las citas inline [ARCHIVO.md] EXACTAMENTE donde estan en el texto. No las muevas ni elimines.',
-    '3. No agregues pie de fuentes al final — el sistema lo agrega automaticamente.',
-    '4. No agregues informacion nueva ni cambies hechos. Solo cambia el estilo.',
+    'MODO RESPUESTA CON DOCUMENTOS:',
+    'Se te entregan documentos institucionales. Responde la pregunta basandote en ellos con tu personalidad.',
+    'REGLA INQUEBRANTABLE: Cada afirmacion extraida de un documento DEBE terminar con [NOMBRE EXACTO DEL ARCHIVO.md].',
+    'Ejemplo correcto: "Todo dato critico tiene un responsable definido [CARACTERIZACIÓN GOBIERNO DE DATOS.md] ⚽"',
+    'Si parte de la respuesta no esta en los documentos, respondela con conocimiento general aclarando que es tuyo.',
+    'No agregues pie de fuentes al final — el sistema lo agrega automaticamente. Solo pon las citas inline.',
   ].join('\n');
 
   private readonly marioFreeAnswerPrompt = [
@@ -321,6 +321,7 @@ export class IaService {
             generationConfig: {
               temperature: 0.85,
               maxOutputTokens: 350,
+              thinkingConfig: { thinkingBudget: 0 },
             },
           }),
           signal: AbortSignal.timeout(this.geminiTimeoutMs),
@@ -350,11 +351,11 @@ export class IaService {
       .join('\n')
       .trim();
     const finishReason = candidate?.finishReason;
-    const isComplete = !finishReason || finishReason === 'STOP';
+    const acceptable = !finishReason || finishReason === 'STOP' || finishReason === 'MAX_TOKENS';
 
-    if (!text || !isComplete) {
+    if (!text || !acceptable) {
       throw new InternalServerErrorException({
-        message: 'Google AI response was empty or truncated.',
+        message: 'Google AI response was empty or blocked.',
         finishReason,
       });
     }
@@ -554,22 +555,10 @@ export class IaService {
       `[Paso1] classificationVar=${classificationVar}, docsVar=[${docsVar.join(', ')}]`,
     );
 
-    // PASO 2 — Respondedor factual (IA): usa docsVar para leer y responder con cita inline
-    let factualContent: string | null = null;
-
+    // PASO 2 — Mario responde directamente con los docs en contexto (o libremente si no hay docs)
     if (classificationVar === 'local_docs' || classificationVar === 'mixed') {
-      const mixedNote =
-        classificationVar === 'mixed'
-          ? '\n\nNota: esta pregunta tambien tiene una parte que no esta en los documentos — respondela con tu conocimiento general al final, aclarando que es conocimiento propio.'
-          : '';
-      factualContent =
-        (await this.generateFactualResponse(questionVar, docsVar)) + mixedNote;
-      this.logger.log('[Paso2] respuesta factual generada.');
-    }
-
-    // PASO 3 — Mario (IA): aplica personalidad sobre el contenido generado
-    if (factualContent !== null) {
-      marioResponse = await this.reformulateAsMario(factualContent);
+      marioResponse = await this.answerMarioWithDocs(questionVar, docsVar, classificationVar === 'mixed');
+      this.logger.log('[Paso2] Mario respondio con documentos.');
     } else {
       marioResponse = await this.answerAsMario(questionVar, context);
     }
@@ -687,10 +676,11 @@ export class IaService {
     }
   }
 
-  // PASO 2: genera respuesta factual usando SOLO los documentos indicados
-  private async generateFactualResponse(
+  // PASO 2a: Mario responde directamente usando los documentos indicados
+  private async answerMarioWithDocs(
     question: string,
     relevantDocs: string[],
+    isMixed: boolean,
   ): Promise<string> {
     const docs = relevantDocs
       .map((filename) => {
@@ -700,39 +690,29 @@ export class IaService {
       .filter((d): d is { filename: string; content: string } => d !== null);
 
     if (docs.length === 0) {
-      return 'No se encontro el contenido de los documentos indicados.';
+      return this.callProvider(this.marioFreeAnswerPrompt, question, 600, 0.85);
     }
 
     const docBlocks = docs
       .map((d) => `### Documento: ${d.filename}\n${d.content}`)
       .join('\n\n---\n\n');
 
+    const mixedNote = isMixed
+      ? '\nSi parte de la pregunta no esta cubierta por los documentos, respondela con tu conocimiento general aclarando que es conocimiento propio.'
+      : '';
+
     const systemPrompt = [
-      'Eres un asistente de consulta documental. Responde la pregunta basandote UNICAMENTE en los documentos proporcionados.',
-      '',
-      'REGLA OBLIGATORIA: Cada afirmacion extraida de un documento debe terminar con [NOMBRE DEL ARCHIVO.md] citando el nombre exacto.',
-      'No uses conocimiento externo. Si algo no esta en los documentos, dilo explicitamente.',
-      'Responde claro y directo. Sin personalidad ni emojis — otro agente se encargara del estilo.',
+      this.marioWithDocsPrompt + mixedNote,
       '',
       '=== DOCUMENTOS ===',
       docBlocks,
       '=== FIN DE DOCUMENTOS ===',
     ].join('\n');
 
-    return this.callProvider(systemPrompt, question, 400, 0.3);
+    return this.callProvider(systemPrompt, question, 600, 0.85);
   }
 
-  // PASO 3a: Mario aplica personalidad sobre una respuesta factual ya generada
-  private async reformulateAsMario(factualContent: string): Promise<string> {
-    return this.callProvider(
-      this.marioPersonalityPrompt,
-      `Reformula esto con tu personalidad:\n\n${factualContent}`,
-      400,
-      0.85,
-    );
-  }
-
-  // PASO 3b: Mario responde libremente (no hay docs relevantes)
+  // PASO 2b: Mario responde libremente (no hay docs relevantes)
   private async answerAsMario(
     question: string,
     context: AiConversationContext[],
@@ -867,7 +847,7 @@ export class IaService {
           body: JSON.stringify({
             systemInstruction: { parts: [{ text: systemPrompt }] },
             contents,
-            generationConfig: { temperature, maxOutputTokens: maxTokens },
+            generationConfig: { temperature, maxOutputTokens: maxTokens, thinkingConfig: { thinkingBudget: 0 } },
           }),
           signal: AbortSignal.timeout(this.geminiTimeoutMs),
         },
@@ -895,12 +875,17 @@ export class IaService {
       .join('\n')
       .trim();
     const finishReason = candidate?.finishReason;
+    const acceptable = !finishReason || finishReason === 'STOP' || finishReason === 'MAX_TOKENS';
 
-    if (!text || (finishReason && finishReason !== 'STOP')) {
+    if (!text || !acceptable) {
       throw new InternalServerErrorException({
-        message: 'Google AI response was empty or truncated.',
+        message: 'Google AI response was empty or blocked.',
         finishReason,
       });
+    }
+
+    if (finishReason === 'MAX_TOKENS') {
+      this.logger.warn(`[Gemini] Respuesta alcanzó MAX_TOKENS — texto parcial retornado.`);
     }
 
     return text;
