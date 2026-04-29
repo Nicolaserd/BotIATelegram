@@ -73,10 +73,14 @@ export class IaService {
     'No inventes datos. No pierdas el objetivo por hacer chistes. Sin ofensas extremas.',
     '',
     'MODO REFORMULACION:',
-    'Se te entrega contenido factual ya elaborado. Tu tarea:',
-    '1. Reformulalo con tu personalidad, tono y emojis.',
-    '2. Si el contenido tiene citas [ARCHIVO.md], conservalas EXACTAMENTE donde estan. No las muevas ni modifiques.',
-    '3. No agregues informacion nueva ni cambies hechos. Solo cambia el estilo.',
+    'Se te entrega contenido factual ya elaborado y la lista de documentos de origen.',
+    'Tu tarea:',
+    '1. Reformula el contenido con tu personalidad, tono y emojis.',
+    '2. Conserva las citas inline [ARCHIVO.md] EXACTAMENTE donde estan en el texto.',
+    '3. AL FINAL del mensaje agrega siempre una linea de fuentes con el siguiente formato exacto:',
+    '   📎 Fuente: [NOMBRE_DEL_ARCHIVO.md]',
+    '   Si son varios documentos, ponlos separados por coma en esa misma linea.',
+    '4. No agregues informacion nueva ni cambies hechos. Solo cambia el estilo.',
   ].join('\n');
 
   private readonly marioFreeAnswerPrompt = [
@@ -559,12 +563,14 @@ export class IaService {
 
     // PASO 3 — Mario aplica personalidad
     if (factualContent !== null) {
-      // local_docs o mixed: Mario reformula la respuesta factual (con citas)
       const mixedNote =
         classification.needsGeneral
           ? '\n\nNota: esta pregunta tambien tiene una parte que no esta en los documentos — respondela con tu conocimiento general al final, aclarando que es conocimiento propio.'
           : '';
-      return this.reformulateAsMario(factualContent + mixedNote);
+      return this.reformulateAsMario(
+        factualContent + mixedNote,
+        classification.relevantDocs,
+      );
     }
 
     // no_docs: Mario responde libremente desde su conocimiento
@@ -686,10 +692,18 @@ export class IaService {
   }
 
   // PASO 3a: Mario aplica personalidad sobre una respuesta factual ya generada
-  private async reformulateAsMario(factualContent: string): Promise<string> {
+  private async reformulateAsMario(
+    factualContent: string,
+    sourceDocs: string[] = [],
+  ): Promise<string> {
+    const docsLine =
+      sourceDocs.length > 0
+        ? `\nDocumentos de origen (DEBES citarlos al pie): ${sourceDocs.map((d) => `[${d}]`).join(', ')}`
+        : '';
+
     return this.callProvider(
       this.marioPersonalityPrompt,
-      `Reformula esto con tu personalidad:\n\n${factualContent}`,
+      `Reformula esto con tu personalidad:${docsLine}\n\n${factualContent}`,
       400,
       0.85,
     );
