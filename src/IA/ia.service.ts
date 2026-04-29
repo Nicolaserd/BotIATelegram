@@ -73,13 +73,10 @@ export class IaService {
     'No inventes datos. No pierdas el objetivo por hacer chistes. Sin ofensas extremas.',
     '',
     'MODO REFORMULACION:',
-    'Se te entrega contenido factual ya elaborado y la lista de documentos de origen.',
-    'Tu tarea:',
-    '1. Reformula el contenido con tu personalidad, tono y emojis.',
-    '2. Conserva las citas inline [ARCHIVO.md] EXACTAMENTE donde estan en el texto.',
-    '3. AL FINAL del mensaje agrega siempre una linea de fuentes con el siguiente formato exacto:',
-    '   📎 Fuente: [NOMBRE_DEL_ARCHIVO.md]',
-    '   Si son varios documentos, ponlos separados por coma en esa misma linea.',
+    'Se te entrega contenido factual ya elaborado. Tu tarea:',
+    '1. Reformulalo con tu personalidad, tono y emojis.',
+    '2. Conserva las citas inline [ARCHIVO.md] EXACTAMENTE donde estan en el texto. No las muevas ni elimines.',
+    '3. No agregues pie de fuentes al final — el sistema lo agrega automaticamente.',
     '4. No agregues informacion nueva ni cambies hechos. Solo cambia el estilo.',
   ].join('\n');
 
@@ -541,40 +538,74 @@ export class IaService {
     userMessage: string,
     context: AiConversationContext[] = [],
   ): Promise<string> {
-    // PASO 1 — Clasificador: lee el índice y decide qué tipo de respuesta necesita
-    const classification = await this.classify(userMessage);
+    // ── Variables locales del turno ──────────────────────────────────────────
+    let questionVar: string = userMessage;
+    let classificationVar: ClassificationResult['type'];
+    let docsVar: string[];
+    let marioResponse: string;
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // PASO 1 — Clasificador (IA): lee INDEX.md + pregunta → llena classificationVar y docsVar
+    const classification = await this.classify(questionVar);
+    classificationVar = classification.type;
+    docsVar = classification.relevantDocs;
+
     this.logger.log(
-      `[Agente] clasificacion: ${classification.type}, docs=[${classification.relevantDocs.join(', ')}]`,
+      `[Paso1] classificationVar=${classificationVar}, docsVar=[${docsVar.join(', ')}]`,
     );
 
+    // PASO 2 — Respondedor factual (IA): usa docsVar para leer y responder con cita inline
     let factualContent: string | null = null;
 
-    // PASO 2 — Respondedor factual (solo si hay docs relevantes)
-    if (
-      classification.type === 'local_docs' ||
-      classification.type === 'mixed'
-    ) {
-      factualContent = await this.generateFactualResponse(
-        userMessage,
-        classification.relevantDocs,
-      );
-      this.logger.log('[Agente] respuesta factual generada.');
-    }
-
-    // PASO 3 — Mario aplica personalidad
-    if (factualContent !== null) {
+    if (classificationVar === 'local_docs' || classificationVar === 'mixed') {
       const mixedNote =
-        classification.needsGeneral
+        classificationVar === 'mixed'
           ? '\n\nNota: esta pregunta tambien tiene una parte que no esta en los documentos — respondela con tu conocimiento general al final, aclarando que es conocimiento propio.'
           : '';
-      return this.reformulateAsMario(
-        factualContent + mixedNote,
-        classification.relevantDocs,
-      );
+      factualContent =
+        (await this.generateFactualResponse(questionVar, docsVar)) + mixedNote;
+      this.logger.log('[Paso2] respuesta factual generada.');
     }
 
-    // no_docs: Mario responde libremente desde su conocimiento
-    return this.answerAsMario(userMessage, context);
+    // PASO 3 — Mario (IA): aplica personalidad sobre el contenido generado
+    if (factualContent !== null) {
+      marioResponse = await this.reformulateAsMario(factualContent);
+    } else {
+      marioResponse = await this.answerAsMario(questionVar, context);
+    }
+
+    // El SISTEMA (no el modelo) agrega el pie de fuentes tomando de docsVar
+    const footer = this.buildFooter(docsVar, classificationVar);
+    const finalResponse = marioResponse + footer;
+
+    // Limpiar variables locales del turno
+    questionVar = '';
+    classificationVar = 'no_docs';
+    docsVar = [];
+    marioResponse = '';
+
+    return finalResponse;
+  }
+
+  private buildFooter(
+    docsVar: string[],
+    classificationVar: ClassificationResult['type'],
+  ): string {
+    const lines: string[] = [''];
+
+    if (docsVar.length > 0) {
+      const citas = docsVar.map((d) => `[${d}]`).join(', ');
+      lines.push(`📎 Fuente: ${citas}`);
+    }
+
+    const tipoLabel: Record<ClassificationResult['type'], string> = {
+      local_docs: 'Respondido con documentos internos',
+      mixed: 'Respondido con documentos internos + conocimiento general',
+      no_docs: 'Respondido con conocimiento general',
+    };
+    lines.push(`🗂 ${tipoLabel[classificationVar]}`);
+
+    return '\n' + lines.join('\n');
   }
 
   // PASO 1: llama a la IA con el índice y pide clasificacion JSON
@@ -692,18 +723,10 @@ export class IaService {
   }
 
   // PASO 3a: Mario aplica personalidad sobre una respuesta factual ya generada
-  private async reformulateAsMario(
-    factualContent: string,
-    sourceDocs: string[] = [],
-  ): Promise<string> {
-    const docsLine =
-      sourceDocs.length > 0
-        ? `\nDocumentos de origen (DEBES citarlos al pie): ${sourceDocs.map((d) => `[${d}]`).join(', ')}`
-        : '';
-
+  private async reformulateAsMario(factualContent: string): Promise<string> {
     return this.callProvider(
       this.marioPersonalityPrompt,
-      `Reformula esto con tu personalidad:${docsLine}\n\n${factualContent}`,
+      `Reformula esto con tu personalidad:\n\n${factualContent}`,
       400,
       0.85,
     );
