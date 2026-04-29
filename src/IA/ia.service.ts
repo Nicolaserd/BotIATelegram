@@ -36,7 +36,7 @@ export type AiConversationContext = {
   botMessage: string;
 };
 
-export type ProviderName = 'Gemini' | 'Cerebras' | 'NVIDIA';
+export type ProviderName = 'Gemini' | 'Cerebras-Llama' | 'Cerebras-Qwen' | 'NVIDIA';
 export type ProviderStep = 'classify' | 'answer';
 
 export type ProviderAttempt = {
@@ -48,14 +48,34 @@ export type ProviderAttempt = {
 
 export type TurnTrace = ProviderAttempt[];
 
+type ProviderCallFn = (
+  systemPrompt: string,
+  userMessage: string,
+  maxTokens: number,
+  temperature: number,
+) => Promise<string>;
+
+type ProviderConfig = {
+  name: ProviderName;
+  enabled: boolean;
+  call: ProviderCallFn;
+};
+
 export class AllAiProvidersExhaustedError extends Error {
-  constructor(
-    public readonly geminiError: string | null,
-    public readonly cerebrasError: string | null,
-    public readonly nvidiaError: string | null,
-  ) {
+  public readonly geminiError: string | null;
+  public readonly cerebrasError: string | null;
+  public readonly cerebrasQwenError: string | null;
+  public readonly nvidiaError: string | null;
+  public readonly allErrors: Partial<Record<ProviderName, string | null>>;
+
+  constructor(errors: Partial<Record<ProviderName, string | null>>) {
     super('All AI providers failed or are unavailable.');
     this.name = 'AllAiProvidersExhaustedError';
+    this.allErrors = errors;
+    this.geminiError = errors['Gemini'] ?? null;
+    this.cerebrasError = errors['Cerebras-Llama'] ?? null;
+    this.cerebrasQwenError = errors['Cerebras-Qwen'] ?? null;
+    this.nvidiaError = errors['NVIDIA'] ?? null;
   }
 }
 
@@ -212,9 +232,7 @@ export class IaService {
     return this.runProviderChain(
       'answer',
       undefined,
-      (sys, msg, max, temp) => this.callGeminiWithContext(sys, msg, context, max, temp),
-      (sys, msg, max, temp) => this.callCerebrasWithContext(sys, msg, context, max, temp),
-      (sys, msg, max, temp) => this.callNvidiaWithContext(sys, msg, context, max, temp),
+      this.buildProviderChain(context),
       this.buildSystemPrompt(),
       userMessage,
       350,
@@ -579,9 +597,7 @@ export class IaService {
     return this.runProviderChain(
       'answer',
       trace,
-      (sys, msg, max, temp) => this.callGeminiWithContext(sys, msg, context, max, temp),
-      (sys, msg, max, temp) => this.callCerebrasWithContext(sys, msg, context, max, temp),
-      (sys, msg, max, temp) => this.callNvidiaWithContext(sys, msg, context, max, temp),
+      this.buildProviderChain(context),
       this.marioFreeAnswerPrompt,
       question,
       350,
@@ -601,9 +617,7 @@ export class IaService {
     return this.runProviderChain(
       step,
       trace,
-      (sys, msg, max, temp) => this.callGeminiWithContext(sys, msg, [], max, temp),
-      (sys, msg, max, temp) => this.callCerebrasWithContext(sys, msg, [], max, temp),
-      (sys, msg, max, temp) => this.callNvidiaWithContext(sys, msg, [], max, temp),
+      this.buildProviderChain([]),
       systemPrompt,
       userMessage,
       maxTokens,
@@ -611,73 +625,70 @@ export class IaService {
     );
   }
 
-  // Cadena de fallback compartida: Gemini → Cerebras → NVIDIA, registra cada intento en trace
+  // Construye la cadena de proveedores en orden: Gemini → Cerebras-Llama → Cerebras-Qwen → NVIDIA
+  private buildProviderChain(context: AiConversationContext[]): ProviderConfig[] {
+    return [
+      {
+        name: 'Gemini',
+        enabled: !!(process.env.GOOGLE_AI_API_KEY || process.env.GEMINI_API_KEY),
+        call: (sys, msg, max, temp) => this.callGeminiWithContext(sys, msg, context, max, temp),
+      },
+      {
+        name: 'Cerebras-Llama',
+        enabled: !!process.env.CEREBRAS_API_KEY,
+        call: (sys, msg, max, temp) =>
+          this.callCerebrasWithContext(
+            process.env.CEREBRAS_MODEL_FAST || 'llama3.1-8b',
+            sys, msg, context, max, temp,
+          ),
+      },
+      {
+        name: 'Cerebras-Qwen',
+        enabled: !!process.env.CEREBRAS_API_KEY,
+        call: (sys, msg, max, temp) =>
+          this.callCerebrasWithContext(
+            process.env.CEREBRAS_MODEL_STRONG || 'qwen-3-235b-a22b-instruct-2507',
+            sys, msg, context, max, temp,
+          ),
+      },
+      {
+        name: 'NVIDIA',
+        enabled: !!process.env.NVIDIA_API_KEY,
+        call: (sys, msg, max, temp) => this.callNvidiaWithContext(sys, msg, context, max, temp),
+      },
+    ];
+  }
+
+  // Cadena de fallback: itera proveedores en orden, registra cada intento, retorna el primero ok
   private async runProviderChain(
     step: ProviderStep,
     trace: TurnTrace | undefined,
-    geminiCall: (sys: string, msg: string, max: number, temp: number) => Promise<string>,
-    cerebrasCall: (sys: string, msg: string, max: number, temp: number) => Promise<string>,
-    nvidiaCall: (sys: string, msg: string, max: number, temp: number) => Promise<string>,
+    providers: ProviderConfig[],
     systemPrompt: string,
     userMessage: string,
     maxTokens: number,
     temperature: number,
   ): Promise<string> {
-    const hasGeminiKey = !!(process.env.GOOGLE_AI_API_KEY || process.env.GEMINI_API_KEY);
-    const hasCerebrasKey = !!process.env.CEREBRAS_API_KEY;
-    const hasNvidiaKey = !!process.env.NVIDIA_API_KEY;
+    const errors: Partial<Record<ProviderName, string | null>> = {};
 
-    const record = (provider: ProviderName, status: 'ok' | 'failed', detail?: string) => {
-      trace?.push({ step, provider, status, detail });
-    };
-
-    let geminiError: string | null = null;
-    let cerebrasError: string | null = null;
-    let nvidiaError: string | null = null;
-
-    if (hasGeminiKey) {
+    for (const provider of providers) {
+      if (!provider.enabled) {
+        errors[provider.name] = `${provider.name}: API key no configurada`;
+        continue;
+      }
       try {
-        const result = await geminiCall(systemPrompt, userMessage, maxTokens, temperature);
-        record('Gemini', 'ok');
+        const result = await provider.call(systemPrompt, userMessage, maxTokens, temperature);
+        trace?.push({ step, provider: provider.name, status: 'ok' });
         return result;
       } catch (error) {
-        geminiError = this.describeError(error);
-        record('Gemini', 'failed', geminiError);
-        this.logger.warn(`[chain:${step}] Gemini fallo: ${geminiError}`);
+        const detail = this.describeError(error);
+        errors[provider.name] = detail;
+        trace?.push({ step, provider: provider.name, status: 'failed', detail });
+        this.logger.warn(`[chain:${step}] ${provider.name} fallo: ${detail}`);
       }
-    } else {
-      geminiError = 'GOOGLE_AI_API_KEY/GEMINI_API_KEY no configurada.';
     }
 
-    if (hasCerebrasKey) {
-      try {
-        const result = await cerebrasCall(systemPrompt, userMessage, maxTokens, temperature);
-        record('Cerebras', 'ok');
-        return result;
-      } catch (error) {
-        cerebrasError = this.describeError(error);
-        record('Cerebras', 'failed', cerebrasError);
-        this.logger.warn(`[chain:${step}] Cerebras fallo: ${cerebrasError}`);
-      }
-    } else {
-      cerebrasError = 'CEREBRAS_API_KEY no configurada.';
-    }
-
-    if (hasNvidiaKey) {
-      try {
-        const result = await nvidiaCall(systemPrompt, userMessage, maxTokens, temperature);
-        record('NVIDIA', 'ok');
-        return result;
-      } catch (error) {
-        nvidiaError = this.describeError(error);
-        record('NVIDIA', 'failed', nvidiaError);
-        this.logger.error(`[chain:${step}] NVIDIA fallo: ${nvidiaError}`);
-      }
-    } else {
-      nvidiaError = 'NVIDIA_API_KEY no configurada.';
-    }
-
-    throw new AllAiProvidersExhaustedError(geminiError, cerebrasError, nvidiaError);
+    throw new AllAiProvidersExhaustedError(errors);
   }
 
   // Llamada a Gemini con prompt y contexto explícitos
@@ -753,8 +764,9 @@ export class IaService {
     return text;
   }
 
-  // Llamada a Cerebras (OpenAI-compatible) con prompt y contexto explícitos
+  // Llamada a Cerebras (OpenAI-compatible) con modelo seleccionable + contexto explícitos
   private async callCerebrasWithContext(
+    model: string,
     systemPrompt: string,
     userMessage: string,
     context: AiConversationContext[] = [],
@@ -762,10 +774,10 @@ export class IaService {
     temperature = 0.85,
   ): Promise<string> {
     return this.callOpenAiCompatible(
-      'Cerebras',
+      `Cerebras(${model})`,
       `${this.cerebrasApiBase}/chat/completions`,
       process.env.CEREBRAS_API_KEY,
-      process.env.CEREBRAS_MODEL || 'llama-3.3-70b',
+      model,
       this.cerebrasTimeoutMs,
       systemPrompt,
       userMessage,

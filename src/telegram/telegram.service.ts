@@ -252,7 +252,10 @@ export class TelegramService {
       lines.push(`• Gemini: ${this.shortenForUser(error.geminiError)}`);
     }
     if (error.cerebrasError) {
-      lines.push(`• Cerebras: ${this.shortenForUser(error.cerebrasError)}`);
+      lines.push(`• Cerebras-Llama: ${this.shortenForUser(error.cerebrasError)}`);
+    }
+    if (error.cerebrasQwenError) {
+      lines.push(`• Cerebras-Qwen: ${this.shortenForUser(error.cerebrasQwenError)}`);
     }
     if (error.nvidiaError) {
       lines.push(`• NVIDIA: ${this.shortenForUser(error.nvidiaError)}`);
