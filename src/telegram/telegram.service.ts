@@ -193,7 +193,7 @@ export class TelegramService {
       const context = await this.getConversationContext(chatKey);
 
       await this.sendChatAction(chatId, 'typing');
-      const reply = await this.iaService.generateReply(text, context);
+      const reply = await this.iaService.generateReplyAgented(text, context);
       const telegramReply = `${reply}\n\nuso de el bot 4 veces cada 24 horas intento numero ${attemptNumber}`;
 
       await this.sendMessage(chatId, telegramReply);

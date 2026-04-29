@@ -47,6 +47,12 @@ export class AllAiProvidersExhaustedError extends Error {
   }
 }
 
+export type ClassificationResult = {
+  type: 'local_docs' | 'no_docs' | 'mixed';
+  relevantDocs: string[];
+  needsGeneral: boolean;
+};
+
 @Injectable()
 export class IaService {
   private readonly logger = new Logger(IaService.name);
@@ -57,6 +63,34 @@ export class IaService {
   private readonly nvidiaTimeoutMs = 25_000;
   private readonly knowledgeDirName = 'Docuentos_guia';
   private knowledgeBaseCache: string | null = null;
+  private docsCache: Map<string, string> | null = null;
+  private indexContentCache: string | null = null;
+
+  private readonly marioPersonalityPrompt = [
+    'Eres Mario: asistente friki de computacion, relajado, irreverente, humor sarcastico, actitud tipo 10 ⚽.',
+    'Lenguaje informal, emojis a nivel medio (futbol ⚽, pizza 🍕, manzana 🍏🥤). Respuestas cortas salvo que se pida mas.',
+    'Si el usuario menciona pizza: reacciona como foca feliz 🦭🍕 una o dos lineas maximo, luego vuelves al tema.',
+    'No inventes datos. No pierdas el objetivo por hacer chistes. Sin ofensas extremas.',
+    '',
+    'MODO REFORMULACION:',
+    'Se te entrega contenido factual ya elaborado. Tu tarea:',
+    '1. Reformulalo con tu personalidad, tono y emojis.',
+    '2. Si el contenido tiene citas [ARCHIVO.md], conservalas EXACTAMENTE donde estan. No las muevas ni modifiques.',
+    '3. No agregues informacion nueva ni cambies hechos. Solo cambia el estilo.',
+  ].join('\n');
+
+  private readonly marioFreeAnswerPrompt = [
+    'Eres Mario: asistente friki de computacion, relajado, irreverente, humor sarcastico, actitud tipo 10 ⚽.',
+    'Lenguaje informal, emojis a nivel medio (futbol ⚽, pizza 🍕, manzana 🍏🥤). Respuestas cortas salvo que se pida mas.',
+    'Si el usuario menciona pizza: reacciona como foca feliz 🦭🍕 una o dos lineas maximo, luego vuelves al tema.',
+    'No inventes datos tecnicos. Si no sabes algo, dilo claro. Sin ofensas extremas.',
+    'Especialidad: tecnologia, sistemas, seguridad informatica.',
+    '',
+    'MODO RESPUESTA LIBRE:',
+    'La pregunta no esta cubierta por documentos institucionales. Responde con tu conocimiento general.',
+    'No menciones bases de conocimiento internas ni documentos. Simplemente responde como Mario.',
+  ].join('\n');
+
   private readonly marioSystemPrompt = [
     'PROMPT MAESTRO - AGENTE "MARIO"',
     '',
@@ -370,49 +404,52 @@ export class IaService {
     }
 
     try {
-      const files = fs
+      const allFiles = fs
         .readdirSync(docsDir)
-        .filter((file) => file.toLowerCase().endsWith('.md'))
+        .filter((f) => f.toLowerCase().endsWith('.md'));
+
+      const indexFile = allFiles.find((f) => f.toLowerCase() === 'index.md');
+      const docFiles = allFiles
+        .filter((f) => f.toLowerCase() !== 'index.md')
         .sort();
 
-      const docs: {
-        file: string;
-        raw: string;
-        headings: string[];
-        summary: string;
-      }[] = [];
-      for (const file of files) {
-        const fullPath = path.join(docsDir, file);
-        const raw = fs.readFileSync(fullPath, 'utf8').trim();
-        if (!raw) continue;
-        docs.push({
-          file,
-          raw,
-          headings: this.extractHeadings(raw),
-          summary: this.extractSummary(raw),
-        });
-      }
-
-      if (docs.length === 0) {
+      if (!indexFile && docFiles.length === 0) {
         this.knowledgeBaseCache = '';
         return '';
       }
 
-      const index = this.buildKnowledgeIndex(docs);
-      const content = docs
-        .map((doc) => `### Documento: ${doc.file}\n${doc.raw}`)
-        .join('\n\n---\n\n');
+      const parts: string[] = [];
 
-      this.knowledgeBaseCache = [
-        index,
-        '',
-        '--- CONTENIDO COMPLETO DE LOS DOCUMENTOS ---',
-        '',
-        content,
-      ].join('\n');
+      if (indexFile) {
+        const indexContent = fs
+          .readFileSync(path.join(docsDir, indexFile), 'utf8')
+          .trim();
+        parts.push('--- ÍNDICE DE DOCUMENTOS ---');
+        parts.push(indexContent);
+        parts.push('');
+      }
+
+      const docs = docFiles
+        .map((file) => {
+          const raw = fs.readFileSync(path.join(docsDir, file), 'utf8').trim();
+          return raw ? { file, raw } : null;
+        })
+        .filter((d): d is { file: string; raw: string } => d !== null);
+
+      if (docs.length > 0) {
+        parts.push('--- CONTENIDO COMPLETO DE LOS DOCUMENTOS ---');
+        parts.push('');
+        parts.push(
+          docs
+            .map((d) => `### Documento: ${d.file}\n${d.raw}`)
+            .join('\n\n---\n\n'),
+        );
+      }
+
+      this.knowledgeBaseCache = parts.join('\n');
 
       this.logger.log(
-        `Base de conocimiento cargada (${docs.length} archivos, ${this.knowledgeBaseCache.length} chars).`,
+        `Base de conocimiento cargada: indice=${indexFile ?? 'ninguno'}, docs=${docs.length}, chars=${this.knowledgeBaseCache.length}.`,
       );
     } catch (error) {
       this.logger.error(
@@ -422,67 +459,6 @@ export class IaService {
     }
 
     return this.knowledgeBaseCache;
-  }
-
-  private extractSummary(markdown: string): string {
-    const maxLen = 280;
-    for (const block of markdown.split(/\r?\n\s*\r?\n/)) {
-      const cleaned = block
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter((line) => line && !line.startsWith('#') && line !== '---')
-        .join(' ')
-        .replace(/[*_`]/g, '')
-        .trim();
-      if (!cleaned) continue;
-      if (cleaned.toLowerCase().startsWith('documento convertido')) continue;
-      return cleaned.length > maxLen
-        ? cleaned.slice(0, maxLen - 1).trimEnd() + '...'
-        : cleaned;
-    }
-    return '';
-  }
-
-  private extractHeadings(markdown: string): string[] {
-    const headings: string[] = [];
-    for (const line of markdown.split(/\r?\n/)) {
-      const match = /^(#{1,6})\s+(.+?)\s*$/.exec(line);
-      if (!match) continue;
-      const level = match[1].length;
-      const text = match[2].replace(/[*_`]/g, '').trim();
-      if (!text) continue;
-      const indent = '  '.repeat(Math.max(level - 1, 0));
-      headings.push(`${indent}- ${text}`);
-    }
-    return headings;
-  }
-
-  private buildKnowledgeIndex(
-    docs: { file: string; headings: string[]; summary: string }[],
-  ): string {
-    const lines = [
-      '--- INDICE RAPIDO DE DOCUMENTOS ---',
-      'Usa este indice ANTES de leer el contenido completo: revisa el resumen y las secciones de cada documento para decidir cual(es) pueden contener la respuesta. Solo despues lee el cuerpo de esos documentos.',
-      '',
-    ];
-    docs.forEach((doc, i) => {
-      lines.push(`[DOC-${i + 1}] ${doc.file}`);
-      if (doc.summary) {
-        lines.push(`  Resumen: ${doc.summary}`);
-      } else {
-        lines.push('  Resumen: (contenido pendiente)');
-      }
-      if (doc.headings.length === 0) {
-        lines.push('  Secciones: (ninguna detectada)');
-      } else {
-        lines.push('  Secciones:');
-        for (const heading of doc.headings) {
-          lines.push(`    ${heading}`);
-        }
-      }
-      lines.push('');
-    });
-    return lines.join('\n').trimEnd();
   }
 
   private resolveDocsDir(): string | null {
@@ -553,5 +529,462 @@ export class IaService {
         parts: [{ text: userMessage }],
       },
     ];
+  }
+
+  // ─── FLUJO AGENTADO ───────────────────────────────────────────────────────
+
+  async generateReplyAgented(
+    userMessage: string,
+    context: AiConversationContext[] = [],
+  ): Promise<string> {
+    // PASO 1 — Clasificador: lee el índice y decide qué tipo de respuesta necesita
+    const classification = await this.classify(userMessage);
+    this.logger.log(
+      `[Agente] clasificacion: ${classification.type}, docs=[${classification.relevantDocs.join(', ')}]`,
+    );
+
+    let factualContent: string | null = null;
+
+    // PASO 2 — Respondedor factual (solo si hay docs relevantes)
+    if (
+      classification.type === 'local_docs' ||
+      classification.type === 'mixed'
+    ) {
+      factualContent = await this.generateFactualResponse(
+        userMessage,
+        classification.relevantDocs,
+      );
+      this.logger.log('[Agente] respuesta factual generada.');
+    }
+
+    // PASO 3 — Mario aplica personalidad
+    if (factualContent !== null) {
+      // local_docs o mixed: Mario reformula la respuesta factual (con citas)
+      const mixedNote =
+        classification.needsGeneral
+          ? '\n\nNota: esta pregunta tambien tiene una parte que no esta en los documentos — respondela con tu conocimiento general al final, aclarando que es conocimiento propio.'
+          : '';
+      return this.reformulateAsMario(factualContent + mixedNote);
+    }
+
+    // no_docs: Mario responde libremente desde su conocimiento
+    return this.answerAsMario(userMessage, context);
+  }
+
+  // PASO 1: llama a la IA con el índice y pide clasificacion JSON
+  private async classify(question: string): Promise<ClassificationResult> {
+    const fallback: ClassificationResult = {
+      type: 'no_docs',
+      relevantDocs: [],
+      needsGeneral: true,
+    };
+
+    const indexContent = this.getIndexContent();
+    if (!indexContent) {
+      this.logger.warn('[Clasificador] No hay INDEX.md. Usando no_docs.');
+      return fallback;
+    }
+
+    const systemPrompt = [
+      'Eres un clasificador de preguntas. Se te dara el indice de una base de conocimiento y una pregunta.',
+      'Tu UNICA tarea es determinar si la pregunta se responde con los documentos del indice.',
+      '',
+      'Responde UNICAMENTE con JSON valido. Sin markdown, sin texto extra. Solo el objeto JSON.',
+      '',
+      'Formato:',
+      '{"type":"local_docs","relevantDocs":["nombre exacto.md"],"needsGeneral":false}',
+      '',
+      'Valores:',
+      '- type "local_docs": la pregunta se responde completamente con los documentos.',
+      '- type "no_docs": la pregunta no tiene relacion con los documentos.',
+      '- type "mixed": parte se responde con docs, parte requiere conocimiento general.',
+      '- relevantDocs: nombres de archivo EXACTOS del indice. Vacio [] si type es "no_docs".',
+      '- needsGeneral: true si type es "no_docs" o "mixed". false si type es "local_docs".',
+      '',
+      '=== INDICE ===',
+      indexContent,
+      '=== FIN DEL INDICE ===',
+    ].join('\n');
+
+    let raw: string;
+    try {
+      raw = await this.callProvider(systemPrompt, question, 200, 0.1);
+    } catch (error) {
+      this.logger.warn(
+        `[Clasificador] Error al llamar a la IA: ${this.describeError(error)}. Usando no_docs.`,
+      );
+      return fallback;
+    }
+
+    try {
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) throw new Error('No se encontro JSON en la respuesta');
+      const parsed = JSON.parse(jsonMatch[0]) as {
+        type?: string;
+        relevantDocs?: unknown;
+        needsGeneral?: unknown;
+      };
+
+      const type = ['local_docs', 'no_docs', 'mixed'].includes(
+        parsed.type ?? '',
+      )
+        ? (parsed.type as ClassificationResult['type'])
+        : 'no_docs';
+
+      const relevantDocs = Array.isArray(parsed.relevantDocs)
+        ? (parsed.relevantDocs as unknown[])
+            .filter((d): d is string => typeof d === 'string')
+        : [];
+
+      const needsGeneral =
+        typeof parsed.needsGeneral === 'boolean'
+          ? parsed.needsGeneral
+          : type !== 'local_docs';
+
+      return { type, relevantDocs, needsGeneral };
+    } catch {
+      this.logger.warn(
+        `[Clasificador] No se pudo parsear JSON: "${raw.slice(0, 120)}". Usando no_docs.`,
+      );
+      return fallback;
+    }
+  }
+
+  // PASO 2: genera respuesta factual usando SOLO los documentos indicados
+  private async generateFactualResponse(
+    question: string,
+    relevantDocs: string[],
+  ): Promise<string> {
+    const docs = relevantDocs
+      .map((filename) => {
+        const content = this.getDocumentContent(filename);
+        return content ? { filename, content } : null;
+      })
+      .filter((d): d is { filename: string; content: string } => d !== null);
+
+    if (docs.length === 0) {
+      return 'No se encontro el contenido de los documentos indicados.';
+    }
+
+    const docBlocks = docs
+      .map((d) => `### Documento: ${d.filename}\n${d.content}`)
+      .join('\n\n---\n\n');
+
+    const systemPrompt = [
+      'Eres un asistente de consulta documental. Responde la pregunta basandote UNICAMENTE en los documentos proporcionados.',
+      '',
+      'REGLA OBLIGATORIA: Cada afirmacion extraida de un documento debe terminar con [NOMBRE DEL ARCHIVO.md] citando el nombre exacto.',
+      'No uses conocimiento externo. Si algo no esta en los documentos, dilo explicitamente.',
+      'Responde claro y directo. Sin personalidad ni emojis — otro agente se encargara del estilo.',
+      '',
+      '=== DOCUMENTOS ===',
+      docBlocks,
+      '=== FIN DE DOCUMENTOS ===',
+    ].join('\n');
+
+    return this.callProvider(systemPrompt, question, 400, 0.3);
+  }
+
+  // PASO 3a: Mario aplica personalidad sobre una respuesta factual ya generada
+  private async reformulateAsMario(factualContent: string): Promise<string> {
+    return this.callProvider(
+      this.marioPersonalityPrompt,
+      `Reformula esto con tu personalidad:\n\n${factualContent}`,
+      400,
+      0.85,
+    );
+  }
+
+  // PASO 3b: Mario responde libremente (no hay docs relevantes)
+  private async answerAsMario(
+    question: string,
+    context: AiConversationContext[],
+  ): Promise<string> {
+    const hasGeminiKey = !!(
+      process.env.GOOGLE_AI_API_KEY || process.env.GEMINI_API_KEY
+    );
+    const hasNvidiaKey = !!process.env.NVIDIA_API_KEY;
+
+    let geminiError: string | null = null;
+    let nvidiaError: string | null = null;
+
+    if (hasGeminiKey) {
+      try {
+        return await this.callGeminiWithContext(
+          this.marioFreeAnswerPrompt,
+          question,
+          context,
+        );
+      } catch (error) {
+        geminiError = this.describeError(error);
+        this.logger.warn(`[MarioLibre] Gemini fallo: ${geminiError}`);
+      }
+    } else {
+      geminiError = 'GOOGLE_AI_API_KEY/GEMINI_API_KEY no configurada.';
+    }
+
+    if (hasNvidiaKey) {
+      try {
+        return await this.callNvidiaWithContext(
+          this.marioFreeAnswerPrompt,
+          question,
+          context,
+        );
+      } catch (error) {
+        nvidiaError = this.describeError(error);
+        this.logger.error(`[MarioLibre] NVIDIA fallo: ${nvidiaError}`);
+      }
+    } else {
+      nvidiaError = 'NVIDIA_API_KEY no configurada.';
+    }
+
+    throw new AllAiProvidersExhaustedError(geminiError, nvidiaError);
+  }
+
+  // Llamada IA con prompt personalizado y SIN historial (clasificador, factual, reformulacion)
+  private async callProvider(
+    systemPrompt: string,
+    userMessage: string,
+    maxTokens = 350,
+    temperature = 0.4,
+  ): Promise<string> {
+    const hasGeminiKey = !!(
+      process.env.GOOGLE_AI_API_KEY || process.env.GEMINI_API_KEY
+    );
+    const hasNvidiaKey = !!process.env.NVIDIA_API_KEY;
+
+    let geminiError: string | null = null;
+    let nvidiaError: string | null = null;
+
+    if (hasGeminiKey) {
+      try {
+        return await this.callGeminiWithContext(
+          systemPrompt,
+          userMessage,
+          [],
+          maxTokens,
+          temperature,
+        );
+      } catch (error) {
+        geminiError = this.describeError(error);
+        this.logger.warn(
+          `[callProvider] Gemini fallo: ${geminiError}${hasNvidiaKey ? ', intentando NVIDIA' : ''}`,
+        );
+      }
+    } else {
+      geminiError = 'GOOGLE_AI_API_KEY/GEMINI_API_KEY no configurada.';
+    }
+
+    if (hasNvidiaKey) {
+      try {
+        return await this.callNvidiaWithContext(
+          systemPrompt,
+          userMessage,
+          [],
+          maxTokens,
+          temperature,
+        );
+      } catch (error) {
+        nvidiaError = this.describeError(error);
+        this.logger.error(`[callProvider] NVIDIA fallo: ${nvidiaError}`);
+      }
+    } else {
+      nvidiaError = 'NVIDIA_API_KEY no configurada.';
+    }
+
+    throw new AllAiProvidersExhaustedError(geminiError, nvidiaError);
+  }
+
+  // Llamada a Gemini con prompt y contexto explícitos
+  private async callGeminiWithContext(
+    systemPrompt: string,
+    userMessage: string,
+    context: AiConversationContext[] = [],
+    maxTokens = 350,
+    temperature = 0.85,
+  ): Promise<string> {
+    const apiKey = process.env.GOOGLE_AI_API_KEY || process.env.GEMINI_API_KEY;
+    const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+
+    if (!apiKey) {
+      throw new InternalServerErrorException(
+        'Missing GOOGLE_AI_API_KEY environment variable.',
+      );
+    }
+
+    const contents = [
+      ...context.flatMap((c) => [
+        { role: 'user', parts: [{ text: c.userMessage }] },
+        { role: 'model', parts: [{ text: c.botMessage }] },
+      ]),
+      { role: 'user', parts: [{ text: userMessage }] },
+    ];
+
+    let response: Response;
+    try {
+      response = await fetch(
+        `${this.geminiApiBase}/models/${model}:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: systemPrompt }] },
+            contents,
+            generationConfig: { temperature, maxOutputTokens: maxTokens },
+          }),
+          signal: AbortSignal.timeout(this.geminiTimeoutMs),
+        },
+      );
+    } catch (error) {
+      throw new InternalServerErrorException({
+        message: 'Google AI request did not respond.',
+        cause: this.describeError(error),
+      });
+    }
+
+    const data = (await response.json()) as GeminiResponse;
+    if (!response.ok || data.error) {
+      throw new InternalServerErrorException({
+        message: 'Google AI request failed.',
+        status: response.status,
+        error: data.error?.message,
+      });
+    }
+
+    const candidate = data.candidates?.[0];
+    const text = candidate?.content?.parts
+      ?.map((p) => p.text)
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+    const finishReason = candidate?.finishReason;
+
+    if (!text || (finishReason && finishReason !== 'STOP')) {
+      throw new InternalServerErrorException({
+        message: 'Google AI response was empty or truncated.',
+        finishReason,
+      });
+    }
+
+    return text;
+  }
+
+  // Llamada a NVIDIA con prompt y contexto explícitos
+  private async callNvidiaWithContext(
+    systemPrompt: string,
+    userMessage: string,
+    context: AiConversationContext[] = [],
+    maxTokens = 350,
+    temperature = 0.85,
+  ): Promise<string> {
+    const apiKey = process.env.NVIDIA_API_KEY;
+    const model = process.env.NVIDIA_MODEL || 'deepseek-ai/deepseek-v3.2';
+
+    if (!apiKey) {
+      throw new InternalServerErrorException(
+        'Missing NVIDIA_API_KEY environment variable.',
+      );
+    }
+
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      ...context.flatMap((c) => [
+        { role: 'user', content: c.userMessage },
+        { role: 'assistant', content: c.botMessage },
+      ]),
+      { role: 'user', content: userMessage },
+    ];
+
+    let response: Response;
+    try {
+      response = await fetch(`${this.nvidiaApiBase}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          temperature,
+          max_tokens: maxTokens,
+          stream: false,
+        }),
+        signal: AbortSignal.timeout(this.nvidiaTimeoutMs),
+      });
+    } catch (error) {
+      throw new InternalServerErrorException({
+        message: 'NVIDIA AI request did not respond.',
+        cause: this.describeError(error),
+      });
+    }
+
+    const data = (await response.json()) as NvidiaChatResponse;
+    if (!response.ok || data.error) {
+      throw new InternalServerErrorException({
+        message: 'NVIDIA AI request failed.',
+        status: response.status,
+        error: data.error?.message,
+      });
+    }
+
+    const text = data.choices?.[0]?.message?.content?.trim();
+    if (!text) return 'No pude generar una respuesta en este momento.';
+    return text;
+  }
+
+  // Lee INDEX.md y lo cachea
+  private getIndexContent(): string {
+    if (this.indexContentCache !== null) return this.indexContentCache;
+
+    const docsDir = this.resolveDocsDir();
+    if (!docsDir) {
+      this.indexContentCache = '';
+      return '';
+    }
+    try {
+      const indexPath = path.join(docsDir, 'INDEX.md');
+      this.indexContentCache = fs.existsSync(indexPath)
+        ? fs.readFileSync(indexPath, 'utf8').trim()
+        : '';
+    } catch {
+      this.indexContentCache = '';
+    }
+    return this.indexContentCache;
+  }
+
+  // Lee un documento específico por nombre de archivo y lo cachea
+  private getDocumentContent(filename: string): string | null {
+    if (this.docsCache === null) {
+      this.loadDocsCache();
+    }
+    return this.docsCache?.get(filename) ?? null;
+  }
+
+  private loadDocsCache(): void {
+    this.docsCache = new Map();
+    const docsDir = this.resolveDocsDir();
+    if (!docsDir) return;
+    try {
+      const files = fs
+        .readdirSync(docsDir)
+        .filter(
+          (f) =>
+            f.toLowerCase().endsWith('.md') && f.toLowerCase() !== 'index.md',
+        );
+      for (const file of files) {
+        const content = fs
+          .readFileSync(path.join(docsDir, file), 'utf8')
+          .trim();
+        if (content) this.docsCache!.set(file, content);
+      }
+      this.logger.log(
+        `[DocsCache] ${this.docsCache.size} documento(s) cargado(s).`,
+      );
+    } catch (error) {
+      this.logger.error(
+        `[DocsCache] Error cargando docs: ${this.describeError(error)}`,
+      );
+    }
   }
 }
