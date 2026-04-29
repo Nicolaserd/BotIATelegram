@@ -26,20 +26,36 @@ type NvidiaChatResponse = {
     message?: {
       content?: string;
     };
+    finish_reason?: string;
   }>;
   error?: {
     message?: string;
   };
 };
 
+type CerebrasChatResponse = NvidiaChatResponse;
+
 export type AiConversationContext = {
   userMessage: string;
   botMessage: string;
 };
 
+export type ProviderName = 'Gemini' | 'Cerebras' | 'NVIDIA';
+export type ProviderStep = 'classify' | 'answer';
+
+export type ProviderAttempt = {
+  step: ProviderStep;
+  provider: ProviderName;
+  status: 'ok' | 'failed';
+  detail?: string;
+};
+
+export type TurnTrace = ProviderAttempt[];
+
 export class AllAiProvidersExhaustedError extends Error {
   constructor(
     public readonly geminiError: string | null,
+    public readonly cerebrasError: string | null,
     public readonly nvidiaError: string | null,
   ) {
     super('All AI providers failed or are unavailable.');
@@ -59,7 +75,9 @@ export class IaService {
   private readonly geminiApiBase =
     'https://generativelanguage.googleapis.com/v1beta';
   private readonly nvidiaApiBase = 'https://integrate.api.nvidia.com/v1';
+  private readonly cerebrasApiBase = 'https://api.cerebras.ai/v1';
   private readonly geminiTimeoutMs = 22_000;
+  private readonly cerebrasTimeoutMs = 18_000;
   private readonly nvidiaTimeoutMs = 25_000;
   private readonly knowledgeDirName = 'Docuentos_guia';
   private knowledgeBaseCache: string | null = null;
@@ -195,172 +213,17 @@ export class IaService {
     userMessage: string,
     context: AiConversationContext[] = [],
   ) {
-    const hasGeminiKey =
-      !!(process.env.GOOGLE_AI_API_KEY || process.env.GEMINI_API_KEY);
-    const hasNvidiaKey = !!process.env.NVIDIA_API_KEY;
-
-    let geminiError: string | null = null;
-    let nvidiaError: string | null = null;
-
-    if (hasGeminiKey) {
-      try {
-        return await this.generateGeminiReply(userMessage, context);
-      } catch (error) {
-        geminiError = this.describeError(error);
-        this.logger.warn(
-          `Gemini fallo. Motivo: ${geminiError}${hasNvidiaKey ? ' — intentando fallback NVIDIA/DeepSeek.' : ''}`,
-        );
-      }
-    } else {
-      geminiError = 'GOOGLE_AI_API_KEY/GEMINI_API_KEY no configurada.';
-    }
-
-    if (hasNvidiaKey) {
-      try {
-        return await this.generateNvidiaReply(userMessage, context);
-      } catch (error) {
-        nvidiaError = this.describeError(error);
-        this.logger.error(
-          `NVIDIA tambien fallo. Motivo: ${nvidiaError}`,
-        );
-      }
-    } else {
-      nvidiaError = 'NVIDIA_API_KEY no configurada.';
-    }
-
-    throw new AllAiProvidersExhaustedError(geminiError, nvidiaError);
-  }
-
-  private async generateNvidiaReply(
-    userMessage: string,
-    context: AiConversationContext[],
-  ) {
-    const apiKey = process.env.NVIDIA_API_KEY;
-    const model = process.env.NVIDIA_MODEL || 'deepseek-ai/deepseek-v3.2';
-
-    if (!apiKey) {
-      throw new InternalServerErrorException(
-        'Missing NVIDIA_API_KEY environment variable.',
-      );
-    }
-
-    let response: Response;
-    try {
-      response = await fetch(`${this.nvidiaApiBase}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model,
-          messages: this.buildNvidiaMessages(userMessage, context),
-          temperature: 0.85,
-          max_tokens: 350,
-          stream: false,
-        }),
-        signal: AbortSignal.timeout(this.nvidiaTimeoutMs),
-      });
-    } catch (error) {
-      throw new InternalServerErrorException({
-        message: 'NVIDIA AI request did not respond.',
-        cause: this.describeError(error),
-      });
-    }
-
-    const data = (await response.json()) as NvidiaChatResponse;
-
-    if (!response.ok || data.error) {
-      throw new InternalServerErrorException({
-        message: 'NVIDIA AI request failed.',
-        status: response.status,
-        error: data.error?.message,
-      });
-    }
-
-    const text = data.choices?.[0]?.message?.content?.trim();
-
-    if (!text) {
-      return 'No pude generar una respuesta en este momento.';
-    }
-
-    return text;
-  }
-
-  private async generateGeminiReply(
-    userMessage: string,
-    context: AiConversationContext[],
-  ) {
-    const apiKey = process.env.GOOGLE_AI_API_KEY || process.env.GEMINI_API_KEY;
-    const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-
-    if (!apiKey) {
-      throw new InternalServerErrorException(
-        'Missing GOOGLE_AI_API_KEY environment variable.',
-      );
-    }
-
-    let response: Response;
-    try {
-      response = await fetch(
-        `${this.geminiApiBase}/models/${model}:generateContent?key=${apiKey}`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            systemInstruction: {
-              parts: [
-                {
-                  text: this.buildSystemPrompt(),
-                },
-              ],
-            },
-            contents: this.buildContents(userMessage, context),
-            generationConfig: {
-              temperature: 0.85,
-              maxOutputTokens: 350,
-              thinkingConfig: { thinkingBudget: 0 },
-            },
-          }),
-          signal: AbortSignal.timeout(this.geminiTimeoutMs),
-        },
-      );
-    } catch (error) {
-      throw new InternalServerErrorException({
-        message: 'Google AI request did not respond.',
-        cause: this.describeError(error),
-      });
-    }
-
-    const data = (await response.json()) as GeminiResponse;
-
-    if (!response.ok || data.error) {
-      throw new InternalServerErrorException({
-        message: 'Google AI request failed.',
-        status: response.status,
-        error: data.error?.message,
-      });
-    }
-
-    const candidate = data.candidates?.[0];
-    const text = candidate?.content?.parts
-      ?.map((part) => part.text)
-      .filter(Boolean)
-      .join('\n')
-      .trim();
-    const finishReason = candidate?.finishReason;
-    const acceptable = !finishReason || finishReason === 'STOP' || finishReason === 'MAX_TOKENS';
-
-    if (!text || !acceptable) {
-      throw new InternalServerErrorException({
-        message: 'Google AI response was empty or blocked.',
-        finishReason,
-      });
-    }
-
-    return text;
+    return this.runProviderChain(
+      'answer',
+      undefined,
+      (sys, msg, max, temp) => this.callGeminiWithContext(sys, msg, context, max, temp),
+      (sys, msg, max, temp) => this.callCerebrasWithContext(sys, msg, context, max, temp),
+      (sys, msg, max, temp) => this.callNvidiaWithContext(sys, msg, context, max, temp),
+      this.buildSystemPrompt(),
+      userMessage,
+      350,
+      0.85,
+    );
   }
 
   private describeError(error: unknown): string {
@@ -481,58 +344,6 @@ export class IaService {
     return null;
   }
 
-  private buildNvidiaMessages(
-    userMessage: string,
-    context: AiConversationContext[],
-  ) {
-    const contextMessages = context.flatMap((conversation) => [
-      {
-        role: 'user',
-        content: conversation.userMessage,
-      },
-      {
-        role: 'assistant',
-        content: conversation.botMessage,
-      },
-    ]);
-
-    return [
-      {
-        role: 'system',
-        content: this.buildSystemPrompt(),
-      },
-      ...contextMessages,
-      {
-        role: 'user',
-        content: userMessage,
-      },
-    ];
-  }
-
-  private buildContents(
-    userMessage: string,
-    context: AiConversationContext[],
-  ) {
-    const contextMessages = context.flatMap((conversation) => [
-      {
-        role: 'user',
-        parts: [{ text: conversation.userMessage }],
-      },
-      {
-        role: 'model',
-        parts: [{ text: conversation.botMessage }],
-      },
-    ]);
-
-    return [
-      ...contextMessages,
-      {
-        role: 'user',
-        parts: [{ text: userMessage }],
-      },
-    ];
-  }
-
   // ─── FLUJO AGENTADO ───────────────────────────────────────────────────────
 
   async generateReplyAgented(
@@ -544,10 +355,11 @@ export class IaService {
     let classificationVar: ClassificationResult['type'];
     let docsVar: string[];
     let marioResponse: string;
+    const trace: TurnTrace = [];
     // ─────────────────────────────────────────────────────────────────────────
 
     // PASO 1 — Clasificador (IA): lee INDEX.md + pregunta → llena classificationVar y docsVar
-    const classification = await this.classify(questionVar);
+    const classification = await this.classify(questionVar, trace);
     classificationVar = classification.type;
     docsVar = classification.relevantDocs;
 
@@ -557,14 +369,19 @@ export class IaService {
 
     // PASO 2 — Mario responde directamente con los docs en contexto (o libremente si no hay docs)
     if (classificationVar === 'local_docs' || classificationVar === 'mixed') {
-      marioResponse = await this.answerMarioWithDocs(questionVar, docsVar, classificationVar === 'mixed');
+      marioResponse = await this.answerMarioWithDocs(
+        questionVar,
+        docsVar,
+        classificationVar === 'mixed',
+        trace,
+      );
       this.logger.log('[Paso2] Mario respondio con documentos.');
     } else {
-      marioResponse = await this.answerAsMario(questionVar, context);
+      marioResponse = await this.answerAsMario(questionVar, context, trace);
     }
 
-    // El SISTEMA (no el modelo) agrega el pie de fuentes tomando de docsVar
-    const footer = this.buildFooter(docsVar, classificationVar);
+    // El SISTEMA (no el modelo) agrega el pie de fuentes + trazabilidad
+    const footer = this.buildFooter(docsVar, classificationVar, trace);
     const finalResponse = marioResponse + footer;
 
     // Limpiar variables locales del turno
@@ -579,6 +396,7 @@ export class IaService {
   private buildFooter(
     docsVar: string[],
     classificationVar: ClassificationResult['type'],
+    trace: TurnTrace,
   ): string {
     const lines: string[] = [''];
 
@@ -594,11 +412,54 @@ export class IaService {
     };
     lines.push(`🗂 ${tipoLabel[classificationVar]}`);
 
+    const traceLines = this.formatTrace(trace);
+    if (traceLines.length > 0) {
+      lines.push('🤖 Trazabilidad IA:');
+      lines.push(...traceLines);
+    }
+
     return '\n' + lines.join('\n');
   }
 
+  private formatTrace(trace: TurnTrace): string[] {
+    if (trace.length === 0) return [];
+
+    const stepLabel: Record<ProviderStep, string> = {
+      classify: 'Clasificación',
+      answer: 'Respuesta',
+    };
+
+    const byStep = new Map<ProviderStep, ProviderAttempt[]>();
+    for (const attempt of trace) {
+      const arr = byStep.get(attempt.step) ?? [];
+      arr.push(attempt);
+      byStep.set(attempt.step, arr);
+    }
+
+    const lines: string[] = [];
+    for (const [step, attempts] of byStep) {
+      const chain = attempts
+        .map((a) => {
+          const icon = a.status === 'ok' ? '✅' : '❌';
+          const detail = a.status === 'failed' && a.detail
+            ? ` (${this.shortDetail(a.detail)})`
+            : '';
+          return `${a.provider} ${icon}${detail}`;
+        })
+        .join(' → ');
+      lines.push(`• ${stepLabel[step]}: ${chain}`);
+    }
+    return lines;
+  }
+
+  private shortDetail(detail: string): string {
+    const max = 60;
+    const cleaned = detail.replace(/\s+/g, ' ').trim();
+    return cleaned.length > max ? `${cleaned.slice(0, max - 1)}…` : cleaned;
+  }
+
   // PASO 1: llama a la IA con el índice y pide clasificacion JSON
-  private async classify(question: string): Promise<ClassificationResult> {
+  private async classify(question: string, trace?: TurnTrace): Promise<ClassificationResult> {
     const fallback: ClassificationResult = {
       type: 'no_docs',
       relevantDocs: [],
@@ -634,7 +495,7 @@ export class IaService {
 
     let raw: string;
     try {
-      raw = await this.callProvider(systemPrompt, question, 200, 0.1);
+      raw = await this.callProvider(systemPrompt, question, 200, 0.1, trace, 'classify');
     } catch (error) {
       this.logger.warn(
         `[Clasificador] Error al llamar a la IA: ${this.describeError(error)}. Usando no_docs.`,
@@ -681,6 +542,7 @@ export class IaService {
     question: string,
     relevantDocs: string[],
     isMixed: boolean,
+    trace?: TurnTrace,
   ): Promise<string> {
     const docs = relevantDocs
       .map((filename) => {
@@ -690,7 +552,7 @@ export class IaService {
       .filter((d): d is { filename: string; content: string } => d !== null);
 
     if (docs.length === 0) {
-      return this.callProvider(this.marioFreeAnswerPrompt, question, 600, 0.85);
+      return this.callProvider(this.marioFreeAnswerPrompt, question, 600, 0.85, trace, 'answer');
     }
 
     const docBlocks = docs
@@ -709,107 +571,117 @@ export class IaService {
       '=== FIN DE DOCUMENTOS ===',
     ].join('\n');
 
-    return this.callProvider(systemPrompt, question, 600, 0.85);
+    return this.callProvider(systemPrompt, question, 600, 0.85, trace, 'answer');
   }
 
   // PASO 2b: Mario responde libremente (no hay docs relevantes)
   private async answerAsMario(
     question: string,
     context: AiConversationContext[],
+    trace?: TurnTrace,
   ): Promise<string> {
-    const hasGeminiKey = !!(
-      process.env.GOOGLE_AI_API_KEY || process.env.GEMINI_API_KEY
+    return this.runProviderChain(
+      'answer',
+      trace,
+      (sys, msg, max, temp) => this.callGeminiWithContext(sys, msg, context, max, temp),
+      (sys, msg, max, temp) => this.callCerebrasWithContext(sys, msg, context, max, temp),
+      (sys, msg, max, temp) => this.callNvidiaWithContext(sys, msg, context, max, temp),
+      this.marioFreeAnswerPrompt,
+      question,
+      350,
+      0.85,
     );
-    const hasNvidiaKey = !!process.env.NVIDIA_API_KEY;
-
-    let geminiError: string | null = null;
-    let nvidiaError: string | null = null;
-
-    if (hasGeminiKey) {
-      try {
-        return await this.callGeminiWithContext(
-          this.marioFreeAnswerPrompt,
-          question,
-          context,
-        );
-      } catch (error) {
-        geminiError = this.describeError(error);
-        this.logger.warn(`[MarioLibre] Gemini fallo: ${geminiError}`);
-      }
-    } else {
-      geminiError = 'GOOGLE_AI_API_KEY/GEMINI_API_KEY no configurada.';
-    }
-
-    if (hasNvidiaKey) {
-      try {
-        return await this.callNvidiaWithContext(
-          this.marioFreeAnswerPrompt,
-          question,
-          context,
-        );
-      } catch (error) {
-        nvidiaError = this.describeError(error);
-        this.logger.error(`[MarioLibre] NVIDIA fallo: ${nvidiaError}`);
-      }
-    } else {
-      nvidiaError = 'NVIDIA_API_KEY no configurada.';
-    }
-
-    throw new AllAiProvidersExhaustedError(geminiError, nvidiaError);
   }
 
-  // Llamada IA con prompt personalizado y SIN historial (clasificador, factual, reformulacion)
+  // Llamada IA con prompt personalizado y SIN historial (clasificador, respuesta-con-docs)
   private async callProvider(
     systemPrompt: string,
     userMessage: string,
     maxTokens = 350,
     temperature = 0.4,
+    trace?: TurnTrace,
+    step: ProviderStep = 'answer',
   ): Promise<string> {
-    const hasGeminiKey = !!(
-      process.env.GOOGLE_AI_API_KEY || process.env.GEMINI_API_KEY
+    return this.runProviderChain(
+      step,
+      trace,
+      (sys, msg, max, temp) => this.callGeminiWithContext(sys, msg, [], max, temp),
+      (sys, msg, max, temp) => this.callCerebrasWithContext(sys, msg, [], max, temp),
+      (sys, msg, max, temp) => this.callNvidiaWithContext(sys, msg, [], max, temp),
+      systemPrompt,
+      userMessage,
+      maxTokens,
+      temperature,
     );
+  }
+
+  // Cadena de fallback compartida: Gemini → Cerebras → NVIDIA, registra cada intento en trace
+  private async runProviderChain(
+    step: ProviderStep,
+    trace: TurnTrace | undefined,
+    geminiCall: (sys: string, msg: string, max: number, temp: number) => Promise<string>,
+    cerebrasCall: (sys: string, msg: string, max: number, temp: number) => Promise<string>,
+    nvidiaCall: (sys: string, msg: string, max: number, temp: number) => Promise<string>,
+    systemPrompt: string,
+    userMessage: string,
+    maxTokens: number,
+    temperature: number,
+  ): Promise<string> {
+    const hasGeminiKey = !!(process.env.GOOGLE_AI_API_KEY || process.env.GEMINI_API_KEY);
+    const hasCerebrasKey = !!process.env.CEREBRAS_API_KEY;
     const hasNvidiaKey = !!process.env.NVIDIA_API_KEY;
 
+    const record = (provider: ProviderName, status: 'ok' | 'failed', detail?: string) => {
+      trace?.push({ step, provider, status, detail });
+    };
+
     let geminiError: string | null = null;
+    let cerebrasError: string | null = null;
     let nvidiaError: string | null = null;
 
     if (hasGeminiKey) {
       try {
-        return await this.callGeminiWithContext(
-          systemPrompt,
-          userMessage,
-          [],
-          maxTokens,
-          temperature,
-        );
+        const result = await geminiCall(systemPrompt, userMessage, maxTokens, temperature);
+        record('Gemini', 'ok');
+        return result;
       } catch (error) {
         geminiError = this.describeError(error);
-        this.logger.warn(
-          `[callProvider] Gemini fallo: ${geminiError}${hasNvidiaKey ? ', intentando NVIDIA' : ''}`,
-        );
+        record('Gemini', 'failed', geminiError);
+        this.logger.warn(`[chain:${step}] Gemini fallo: ${geminiError}`);
       }
     } else {
       geminiError = 'GOOGLE_AI_API_KEY/GEMINI_API_KEY no configurada.';
     }
 
+    if (hasCerebrasKey) {
+      try {
+        const result = await cerebrasCall(systemPrompt, userMessage, maxTokens, temperature);
+        record('Cerebras', 'ok');
+        return result;
+      } catch (error) {
+        cerebrasError = this.describeError(error);
+        record('Cerebras', 'failed', cerebrasError);
+        this.logger.warn(`[chain:${step}] Cerebras fallo: ${cerebrasError}`);
+      }
+    } else {
+      cerebrasError = 'CEREBRAS_API_KEY no configurada.';
+    }
+
     if (hasNvidiaKey) {
       try {
-        return await this.callNvidiaWithContext(
-          systemPrompt,
-          userMessage,
-          [],
-          maxTokens,
-          temperature,
-        );
+        const result = await nvidiaCall(systemPrompt, userMessage, maxTokens, temperature);
+        record('NVIDIA', 'ok');
+        return result;
       } catch (error) {
         nvidiaError = this.describeError(error);
-        this.logger.error(`[callProvider] NVIDIA fallo: ${nvidiaError}`);
+        record('NVIDIA', 'failed', nvidiaError);
+        this.logger.error(`[chain:${step}] NVIDIA fallo: ${nvidiaError}`);
       }
     } else {
       nvidiaError = 'NVIDIA_API_KEY no configurada.';
     }
 
-    throw new AllAiProvidersExhaustedError(geminiError, nvidiaError);
+    throw new AllAiProvidersExhaustedError(geminiError, cerebrasError, nvidiaError);
   }
 
   // Llamada a Gemini con prompt y contexto explícitos
@@ -886,6 +758,83 @@ export class IaService {
 
     if (finishReason === 'MAX_TOKENS') {
       this.logger.warn(`[Gemini] Respuesta alcanzó MAX_TOKENS — texto parcial retornado.`);
+    }
+
+    return text;
+  }
+
+  // Llamada a Cerebras (OpenAI-compatible) con prompt y contexto explícitos
+  private async callCerebrasWithContext(
+    systemPrompt: string,
+    userMessage: string,
+    context: AiConversationContext[] = [],
+    maxTokens = 350,
+    temperature = 0.85,
+  ): Promise<string> {
+    const apiKey = process.env.CEREBRAS_API_KEY;
+    const model = process.env.CEREBRAS_MODEL || 'llama-3.3-70b';
+
+    if (!apiKey) {
+      throw new InternalServerErrorException(
+        'Missing CEREBRAS_API_KEY environment variable.',
+      );
+    }
+
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      ...context.flatMap((c) => [
+        { role: 'user', content: c.userMessage },
+        { role: 'assistant', content: c.botMessage },
+      ]),
+      { role: 'user', content: userMessage },
+    ];
+
+    let response: Response;
+    try {
+      response = await fetch(`${this.cerebrasApiBase}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          temperature,
+          max_tokens: maxTokens,
+          stream: false,
+        }),
+        signal: AbortSignal.timeout(this.cerebrasTimeoutMs),
+      });
+    } catch (error) {
+      throw new InternalServerErrorException({
+        message: 'Cerebras request did not respond.',
+        cause: this.describeError(error),
+      });
+    }
+
+    const data = (await response.json()) as CerebrasChatResponse;
+    if (!response.ok || data.error) {
+      throw new InternalServerErrorException({
+        message: 'Cerebras request failed.',
+        status: response.status,
+        error: data.error?.message,
+      });
+    }
+
+    const choice = data.choices?.[0];
+    const text = choice?.message?.content?.trim();
+    const finishReason = choice?.finish_reason;
+
+    if (!text) {
+      throw new InternalServerErrorException({
+        message: 'Cerebras response was empty.',
+        finishReason,
+      });
+    }
+
+    if (finishReason === 'length') {
+      this.logger.warn(`[Cerebras] Respuesta alcanzó max_tokens — texto parcial retornado.`);
     }
 
     return text;

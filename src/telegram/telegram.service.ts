@@ -244,12 +244,15 @@ export class TelegramService {
     error: AllAiProvidersExhaustedError,
   ): string {
     const lines = [
-      '⚠️ Las dos IAs estan caidas o sin cupo ahora mismo. No puedo responder en este momento.',
+      '⚠️ Todas las IAs estan caidas o sin cupo ahora mismo. No puedo responder en este momento.',
       'Intenta de nuevo en unos minutos. Si el problema sigue, avisa al administrador.',
     ];
 
     if (error.geminiError) {
       lines.push(`• Gemini: ${this.shortenForUser(error.geminiError)}`);
+    }
+    if (error.cerebrasError) {
+      lines.push(`• Cerebras: ${this.shortenForUser(error.cerebrasError)}`);
     }
     if (error.nvidiaError) {
       lines.push(`• NVIDIA: ${this.shortenForUser(error.nvidiaError)}`);

@@ -37,6 +37,7 @@ describe('IaService - Mario bot mock', () => {
     delete process.env.GOOGLE_AI_API_KEY;
     delete process.env.GEMINI_API_KEY;
     delete process.env.NVIDIA_API_KEY;
+    delete process.env.CEREBRAS_API_KEY;
 
     fetchMock = jest.fn() as FetchMock;
     global.fetch = fetchMock as unknown as typeof fetch;
