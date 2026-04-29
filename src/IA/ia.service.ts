@@ -1,8 +1,4 @@
-import {
-  Injectable,
-  InternalServerErrorException,
-  Logger,
-} from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
 import { MessageDto } from './messageDto';
@@ -695,11 +691,7 @@ export class IaService {
     const apiKey = process.env.GOOGLE_AI_API_KEY || process.env.GEMINI_API_KEY;
     const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
-    if (!apiKey) {
-      throw new InternalServerErrorException(
-        'Missing GOOGLE_AI_API_KEY environment variable.',
-      );
-    }
+    if (!apiKey) throw new Error('GOOGLE_AI_API_KEY ausente');
 
     const contents = [
       ...context.flatMap((c) => [
@@ -725,19 +717,20 @@ export class IaService {
         },
       );
     } catch (error) {
-      throw new InternalServerErrorException({
-        message: 'Google AI request did not respond.',
-        cause: this.describeError(error),
-      });
+      throw new Error(`fetch falló: ${this.describeNetworkError(error)}`);
     }
 
-    const data = (await response.json()) as GeminiResponse;
+    const rawText = await response.text();
+    let data: GeminiResponse;
+    try {
+      data = JSON.parse(rawText) as GeminiResponse;
+    } catch {
+      throw new Error(`HTTP ${response.status} respuesta no-JSON: ${rawText.slice(0, 150)}`);
+    }
+
     if (!response.ok || data.error) {
-      throw new InternalServerErrorException({
-        message: 'Google AI request failed.',
-        status: response.status,
-        error: data.error?.message,
-      });
+      const apiMsg = data.error?.message || rawText.slice(0, 150);
+      throw new Error(`HTTP ${response.status}: ${apiMsg}`);
     }
 
     const candidate = data.candidates?.[0];
@@ -750,10 +743,7 @@ export class IaService {
     const acceptable = !finishReason || finishReason === 'STOP' || finishReason === 'MAX_TOKENS';
 
     if (!text || !acceptable) {
-      throw new InternalServerErrorException({
-        message: 'Google AI response was empty or blocked.',
-        finishReason,
-      });
+      throw new Error(`respuesta vacía o bloqueada (finishReason=${finishReason ?? 'sin valor'})`);
     }
 
     if (finishReason === 'MAX_TOKENS') {
@@ -771,73 +761,18 @@ export class IaService {
     maxTokens = 350,
     temperature = 0.85,
   ): Promise<string> {
-    const apiKey = process.env.CEREBRAS_API_KEY;
-    const model = process.env.CEREBRAS_MODEL || 'llama-3.3-70b';
-
-    if (!apiKey) {
-      throw new InternalServerErrorException(
-        'Missing CEREBRAS_API_KEY environment variable.',
-      );
-    }
-
-    const messages = [
-      { role: 'system', content: systemPrompt },
-      ...context.flatMap((c) => [
-        { role: 'user', content: c.userMessage },
-        { role: 'assistant', content: c.botMessage },
-      ]),
-      { role: 'user', content: userMessage },
-    ];
-
-    let response: Response;
-    try {
-      response = await fetch(`${this.cerebrasApiBase}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model,
-          messages,
-          temperature,
-          max_tokens: maxTokens,
-          stream: false,
-        }),
-        signal: AbortSignal.timeout(this.cerebrasTimeoutMs),
-      });
-    } catch (error) {
-      throw new InternalServerErrorException({
-        message: 'Cerebras request did not respond.',
-        cause: this.describeError(error),
-      });
-    }
-
-    const data = (await response.json()) as CerebrasChatResponse;
-    if (!response.ok || data.error) {
-      throw new InternalServerErrorException({
-        message: 'Cerebras request failed.',
-        status: response.status,
-        error: data.error?.message,
-      });
-    }
-
-    const choice = data.choices?.[0];
-    const text = choice?.message?.content?.trim();
-    const finishReason = choice?.finish_reason;
-
-    if (!text) {
-      throw new InternalServerErrorException({
-        message: 'Cerebras response was empty.',
-        finishReason,
-      });
-    }
-
-    if (finishReason === 'length') {
-      this.logger.warn(`[Cerebras] Respuesta alcanzó max_tokens — texto parcial retornado.`);
-    }
-
-    return text;
+    return this.callOpenAiCompatible(
+      'Cerebras',
+      `${this.cerebrasApiBase}/chat/completions`,
+      process.env.CEREBRAS_API_KEY,
+      process.env.CEREBRAS_MODEL || 'llama-3.3-70b',
+      this.cerebrasTimeoutMs,
+      systemPrompt,
+      userMessage,
+      context,
+      maxTokens,
+      temperature,
+    );
   }
 
   // Llamada a NVIDIA con prompt y contexto explícitos
@@ -848,14 +783,34 @@ export class IaService {
     maxTokens = 350,
     temperature = 0.85,
   ): Promise<string> {
-    const apiKey = process.env.NVIDIA_API_KEY;
-    const model = process.env.NVIDIA_MODEL || 'deepseek-ai/deepseek-v3.2';
+    return this.callOpenAiCompatible(
+      'NVIDIA',
+      `${this.nvidiaApiBase}/chat/completions`,
+      process.env.NVIDIA_API_KEY,
+      process.env.NVIDIA_MODEL || 'deepseek-ai/deepseek-v3.2',
+      this.nvidiaTimeoutMs,
+      systemPrompt,
+      userMessage,
+      context,
+      maxTokens,
+      temperature,
+    );
+  }
 
-    if (!apiKey) {
-      throw new InternalServerErrorException(
-        'Missing NVIDIA_API_KEY environment variable.',
-      );
-    }
+  // Lógica común para APIs estilo OpenAI (Cerebras + NVIDIA)
+  private async callOpenAiCompatible(
+    label: string,
+    endpoint: string,
+    apiKey: string | undefined,
+    model: string,
+    timeoutMs: number,
+    systemPrompt: string,
+    userMessage: string,
+    context: AiConversationContext[],
+    maxTokens: number,
+    temperature: number,
+  ): Promise<string> {
+    if (!apiKey) throw new Error(`${label}_API_KEY ausente`);
 
     const messages = [
       { role: 'system', content: systemPrompt },
@@ -868,7 +823,7 @@ export class IaService {
 
     let response: Response;
     try {
-      response = await fetch(`${this.nvidiaApiBase}/chat/completions`, {
+      response = await fetch(endpoint, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${apiKey}`,
@@ -881,27 +836,48 @@ export class IaService {
           max_tokens: maxTokens,
           stream: false,
         }),
-        signal: AbortSignal.timeout(this.nvidiaTimeoutMs),
+        signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {
-      throw new InternalServerErrorException({
-        message: 'NVIDIA AI request did not respond.',
-        cause: this.describeError(error),
-      });
+      throw new Error(`fetch falló: ${this.describeNetworkError(error)}`);
     }
 
-    const data = (await response.json()) as NvidiaChatResponse;
+    const rawText = await response.text();
+    let data: NvidiaChatResponse;
+    try {
+      data = JSON.parse(rawText) as NvidiaChatResponse;
+    } catch {
+      throw new Error(`HTTP ${response.status} respuesta no-JSON: ${rawText.slice(0, 150)}`);
+    }
+
     if (!response.ok || data.error) {
-      throw new InternalServerErrorException({
-        message: 'NVIDIA AI request failed.',
-        status: response.status,
-        error: data.error?.message,
-      });
+      const apiMsg = data.error?.message || rawText.slice(0, 150);
+      throw new Error(`HTTP ${response.status}: ${apiMsg}`);
     }
 
-    const text = data.choices?.[0]?.message?.content?.trim();
-    if (!text) return 'No pude generar una respuesta en este momento.';
+    const choice = data.choices?.[0];
+    const text = choice?.message?.content?.trim();
+    const finishReason = choice?.finish_reason;
+
+    if (!text) {
+      throw new Error(`respuesta vacía (finish_reason=${finishReason ?? 'sin valor'})`);
+    }
+
+    if (finishReason === 'length') {
+      this.logger.warn(`[${label}] Respuesta alcanzó max_tokens — texto parcial retornado.`);
+    }
+
     return text;
+  }
+
+  private describeNetworkError(error: unknown): string {
+    if (error instanceof Error) {
+      if (error.name === 'TimeoutError' || error.name === 'AbortError') {
+        return 'timeout';
+      }
+      return `${error.name}: ${error.message}`;
+    }
+    return String(error);
   }
 
   // Lee INDEX.md y lo cachea
